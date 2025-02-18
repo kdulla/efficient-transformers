@@ -108,6 +108,7 @@ from transformers.models.whisper.modeling_whisper import (
     WhisperDecoder,
     WhisperDecoderLayer,
     WhisperEncoder,
+    WhisperForConditionalGeneration,
     WhisperModel,
     WhisperPositionalEmbedding,
 )
@@ -227,6 +228,7 @@ from QEfficient.transformers.models.whisper.modeling_whisper import (
     QEffWhisperDecoder,
     QEffWhisperDecoderLayer,
     QEffWhisperEncoder,
+    QEffWhisperForConditionalGeneration,
     QEffWhisperModel,
     QEffWhisperPositionalEmbedding,
 )
@@ -343,6 +345,7 @@ class KVCacheTransform(ModuleMappingTransform):
         WhisperEncoder: QEffWhisperEncoder,
         WhisperDecoder: QEffWhisperDecoder,
         WhisperModel: QEffWhisperModel,
+        WhisperForConditionalGeneration: QEffWhisperForConditionalGeneration,
     }
 
     @classmethod
