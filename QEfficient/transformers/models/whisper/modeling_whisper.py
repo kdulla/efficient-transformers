@@ -101,46 +101,73 @@ class QEffWhisperAttention(WhisperAttention):
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
 
-        src_len = key_states.size(2)
+            # blocked attention
+            block_size = 32
+            num_blocks = (query_states.shape[2] // block_size)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3))
+            padding_needed = (block_size - (query_states.shape[2] % block_size)) % block_size
+            
+            q_n = nn.functional.pad(query_states, (0, 0, 0, padding_needed))
 
-        if tuple(attn_weights.size()) != (bsz, self.num_heads, tgt_len, src_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, tgt_len, src_len)}, but is"
-                f" {attn_weights.size()}"
-            )
+            hidden_states = (query_states.clone())[:, :, -1:, :]
+            for i in range(num_blocks + 1):
+                
+                query_block = q_n[:, :, i*block_size:(i+1)*block_size, :]
 
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, tgt_len, src_len):
+                attn_weights = (query_block) @ key_states.transpose(2, 3)
+
+                attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+
+                attn_weights = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
+
+                hidden_states_ = torch.matmul(attn_weights, value_states)
+
+                hidden_states = torch.cat([hidden_states, hidden_states_.clone()],dim=2)
+
+            attn_output = hidden_states[:, : , 1:query_states.shape[2] + 1, :]
+
+        
+        if self.is_decoder:
+            src_len = key_states.size(2)
+
+            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3))
+
+            if tuple(attn_weights.size()) != (bsz, self.num_heads, tgt_len, src_len):
                 raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {attention_mask.size()}"
+                    f"Attention weights should be of size {(bsz, self.num_heads, tgt_len, src_len)}, but is"
+                    f" {attn_weights.size()}"
                 )
-            # updated to use torch.where, to prevent overflow in fp16 computation
-            attn_weights = torch.where(attention_mask, torch.tensor(-10000.0, dtype=torch.float32), attn_weights)
 
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+            if attention_mask is not None:
+                if attention_mask.size() != (bsz, 1, tgt_len, src_len):
+                    raise ValueError(
+                        f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {attention_mask.size()}"
+                    )
+                # updated to use torch.where, to prevent overflow in fp16 computation
+                attn_weights = torch.where(attention_mask, torch.tensor(-10000.0, dtype=torch.float32), attn_weights)
 
-        if layer_head_mask is not None:
-            if layer_head_mask.size() != (self.num_heads,):
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+
+            if layer_head_mask is not None:
+                if layer_head_mask.size() != (self.num_heads,):
+                    raise ValueError(
+                        f"Head mask for a single layer should be of size {(self.num_heads,)}, but is"
+                        f" {layer_head_mask.size()}"
+                    )
+                attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+                attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+
+            attn_weights = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
+            attn_output = torch.matmul(attn_weights, value_states)
+
+            if tuple(attn_output.size()) != (bsz, self.num_heads, tgt_len, self.head_dim):
                 raise ValueError(
-                    f"Head mask for a single layer should be of size {(self.num_heads,)}, but is"
-                    f" {layer_head_mask.size()}"
+                    f"`attn_output` should be of size {(bsz, self.num_heads, tgt_len, self.head_dim)}, but is"
+                    f" {attn_output.size()}"
                 )
-            attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
-            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
-        attn_weights = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states)
-
-        if tuple(attn_output.size()) != (bsz, self.num_heads, tgt_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, tgt_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
-
-        attn_output = attn_output.view(bsz, self.num_heads, tgt_len, self.head_dim)
-        attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.view(bsz, self.num_heads, tgt_len, self.head_dim)
+            attn_output = attn_output.transpose(1, 2).contiguous()
 
         # Use the `embed_dim` from the config (stored in the class) rather than `hidden_state` because `attn_output` can be
         # partitioned aross GPUs when using tensor-parallelism.
