@@ -12,7 +12,6 @@ import os
 import subprocess
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
@@ -27,9 +26,8 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
-from QEfficient.utils.cache import QEFF_HOME
 from QEfficient.utils.constants import KWARGS_INCLUSION_LIST, QEFF_MODELS_DIR, Constants, QnnConstants
-from QEfficient.utils.hash_utils import create_export_hash, json_serializable
+from QEfficient.utils.hash_utils import json_serializable
 from QEfficient.utils.logging_utils import logger
 
 
@@ -532,7 +530,6 @@ def create_model_params(qeff_model, **kwargs) -> Dict:
     """
     model_params = copy.deepcopy(kwargs)
     model_params = {k: v for k, v in model_params.items() if k in KWARGS_INCLUSION_LIST}
-    model_params["config"] = qeff_model.model.config.to_diff_dict()
     model_params["peft_config"] = getattr(qeff_model.model, "active_peft_config", None)
     model_params["applied_transform_names"] = qeff_model._transform_names()
     return model_params
