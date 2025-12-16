@@ -310,7 +310,11 @@ class QEFFAutoModel(QEFFTransformersBase):
         """
         return self.model.config.__dict__
 
+<<<<<<< HEAD
     def export(self, export_dir: Optional[str] = None, **kwargs) -> str:
+=======
+    def export(self, export_dir: Optional[str] = None, use_onnx_subfunctions: bool = False, use_layerwise_export: bool = False) -> str:
+>>>>>>> 1dba506 (Layerwise export with onnx subfunction)
         """
         Export the model to ONNX format using ``torch.onnx.export``.
 
@@ -2708,8 +2712,13 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             output_names,
             dynamic_axes,
             export_dir=export_dir,
+<<<<<<< HEAD
             use_layerwise_export=kwargs.get("use_layerwise_export", False),
             use_onnx_subfunctions=kwargs.get("use_onnx_subfunctions", False),
+=======
+            use_onnx_subfunctions=use_onnx_subfunctions,
+            use_layerwise_export=kwargs.get("use_layerwise_export", False),
+>>>>>>> 47aa186 (Layerwise export with onnx subfunction)
             offload_pt_weights=kwargs.get("offload_pt_weights", True),
             prefill_only=prefill_only,
         )
