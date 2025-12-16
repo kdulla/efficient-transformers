@@ -30,6 +30,7 @@ from QEfficient.transformers.modeling_attn_mask_utils import _create_causal_mask
 from QEfficient.utils.constants import MIN_MASKED_ATTENTION_VALUE
 
 
+
 class QEffLlamaRotaryEmbedding(LlamaRotaryEmbedding):
     """
     Copied from LlamaForCausalLM: https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py
@@ -220,7 +221,7 @@ class QEffLlamaDecoderLayer(LlamaDecoderLayer):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-
+        
         return hidden_states
 
 
@@ -241,6 +242,7 @@ class QEffLlamaModel(LlamaModel):
         use_cache: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        layer_indices_to_run: Optional[List[int]] = None,
         **kwargs,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_hidden_states = (
@@ -275,7 +277,9 @@ class QEffLlamaModel(LlamaModel):
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        for layer_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
+            if layer_indices_to_run is not None and not layer_idx in layer_indices_to_run:
+                continue
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -324,6 +328,7 @@ class QEffLlamaForCausalLM(LlamaForCausalLM):
         use_cache: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        layer_indices_to_run: Optional[List[int]] = None,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         output_hidden_states = (
@@ -341,6 +346,7 @@ class QEffLlamaForCausalLM(LlamaForCausalLM):
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
             cache_position=cache_position,
+            layer_indices_to_run=layer_indices_to_run,
             **kwargs,
         )
 

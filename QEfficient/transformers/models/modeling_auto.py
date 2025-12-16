@@ -318,7 +318,7 @@ class QEFFAutoModel(QEFFTransformersBase):
         """
         return self.model.config.__dict__
 
-    def export(self, export_dir: Optional[str] = None, use_onnx_subfunctions: bool = False) -> str:
+    def export(self, export_dir: Optional[str] = None, use_onnx_subfunctions: bool = False, use_layerwise_export: bool = False) -> str:
         """
         Export the model to ONNX format using ``torch.onnx.export``.
 
@@ -356,6 +356,7 @@ class QEFFAutoModel(QEFFTransformersBase):
             dynamic_axes,
             export_dir=export_dir,
             use_onnx_subfunctions=use_onnx_subfunctions,
+            use_layerwise_export=use_layerwise_export,
         )
 
     def compile(
@@ -369,6 +370,7 @@ class QEFFAutoModel(QEFFTransformersBase):
         num_cores: int = 16,  # FIXME: Make this mandatory arg
         mxfp6_matmul: bool = False,
         use_onnx_subfunctions: bool = False,
+        use_layerwise_export: bool = False,
         **compiler_options,
     ) -> str:
         """
@@ -441,6 +443,7 @@ class QEFFAutoModel(QEFFTransformersBase):
             mdp_ts_num_devices=num_devices,
             aic_num_cores=num_cores,
             use_onnx_subfunctions=use_onnx_subfunctions,
+            use_layerwise_export=use_layerwise_export,
             **compiler_options,
         )
 
@@ -2612,6 +2615,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             dynamic_axes,
             export_dir=export_dir,
             use_onnx_subfunctions=use_onnx_subfunctions,
+            use_layerwise_export=kwargs.get("use_layerwise_export", False),
             offload_pt_weights=kwargs.get("offload_pt_weights", True),
         )
 
