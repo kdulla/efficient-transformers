@@ -289,7 +289,7 @@ class QEFFBaseModel(ABC):
                 layerwise_dir = export_dir / "onnx_layerwise_tmp"
                 layerwise_dir.mkdir(parents=True, exist_ok=True)
            
-                from QEfficient.utils._utils import collect_module_inputs, extract_until_first_layer, extract_single_node_with_utils, remove_all_forward_hooks, extract_from_last_layer, stitch_single_layer, stitch_model, measure
+                from QEfficient.utils._utils import collect_module_inputs, extract_until_first_layer, extract_single_node_with_utils, remove_all_forward_hooks, extract_from_last_layer, stitch_single_layer, stitch_model, make_names_unique_in_graph
                 module_inputs, first_layer_name = collect_module_inputs(self.model, example_inputs, layer_class)
 
                 # extract_until_first_layer(layer_onnx_path, layer_onnx_path, first_layer_name)
@@ -352,13 +352,30 @@ class QEFFBaseModel(ABC):
                     # import ipdb; ipdb.set_trace()
                     if stitched_model is None:
                         stitched_model = onnx.load(layer_onnx_path)
+                        # make_names_unique_in_graph(stitched_model, i)
+                        onnx.compose.add_prefix(stitched_model, f"layer_{i}", inplace=True)
+                        # stitched_model.save(sti)
                     else:
                         # print(f"Stitching layer {i}")
+            
                         curr_model = onnx.load(layer_onnx_path)
+                        onnx.compose.add_prefix(curr_model, f"layer_{i}", inplace=True)
                         if i != len(self.model.model.layers) - 1:
-                            stitch_single_layer(stitched_model, curr_model)
+                            io_map = [(stitched_model.graph.output[-1], curr_model.graph.input[0])] # just need to map hidden states to next layer
                         else:
-                            stitch_model(stitched_model, curr_model)
+                            import ipdb; ipdb.set_trace() # need to map past key values correctly
+                        onnx.compose.merge_models(
+                            stitched_model,
+                            curr_model,
+                            io_map=[(stitched_model.graph.output[-1].name, curr_model.graph.input[0].name)]
+                        )
+
+                        # if i != len(self.model.model.layers) - 1:
+                        #     stitch_single_layer(stitched_model, curr_model)
+                        # else:
+                        #     stitch_model(stitched_model, curr_model)
+
+                    import ipdb; ipdb.set_trace()
                 
                 tmp_stitched_path = str(tmp_onnx_dir / f"{self.model_name}_stitched.onnx")
                 stitched_path = str(export_dir / f"{self.model_name}_stitched.onnx")

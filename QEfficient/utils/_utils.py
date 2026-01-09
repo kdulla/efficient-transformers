@@ -536,6 +536,7 @@ def create_model_params(qeff_model, **kwargs) -> Dict:
 
 
 import onnx
+import onnx_ir
 from typing import Set
 
 def pytorch_to_onnx_name(pytorch_name: str) -> str:
@@ -574,17 +575,23 @@ def extract_until_first_layer(model_path: str, save_path: str, first_layer_name:
     # import ipdb; ipdb.set_trace()
 
     # Extract subgraph
-    onnx.utils.extract_model(model_path, save_path, input_names, output_names)
+    model = onnx_ir.load(model_path)
+    model.graph = onnx_ir.convenience.extract(model.graph, input_names, output_names)
+    onnx_ir.save(model, save_path)
+
+    # import ipdb; ipdb.set_trace()
+
+    # onnx.utils.extract_model(model_path, save_path, input_names, output_names)
 
     print(f"Subgraph saved to {save_path}")
 
 def extract_single_node_with_utils(
-    model_path_in: str,
+    model_path: str,
     node_name: str,
-    model_path_out: str,
+    save_path: str,
 ):
     # Load model (we only inspect it to figure out tensor names)
-    m = onnx.load(model_path_in)
+    m = onnx.load(model_path)
     g = m.graph
 
     node_name = pytorch_to_onnx_name(node_name)
@@ -607,15 +614,13 @@ def extract_single_node_with_utils(
         raise RuntimeError(f"Node '{node_name}' has no outputs; cannot extract.")
 
     # Run the official extractor (boundary is input_names -> output_names)
-    onnx.utils.extract_model(
-        input_path=model_path_in,
-        output_path=model_path_out,
-        input_names=input_names,
-        output_names=output_names,
-        check_model=True,      # optional but recommended
-        infer_shapes=True       # helps carry ValueInfo into the subgraph
-    )
-    return model_path_out
+    model = onnx_ir.load(model_path)
+    model.graph = onnx_ir.convenience.extract(model.graph, input_names, output_names)
+    onnx_ir.save(model, save_path)
+
+    print(f"Subgraph saved to {save_path}")
+
+    return save_path
 
 def extract_from_last_layer(model_path: str, save_path: str, last_layer_name: str):
     # Load model
@@ -643,7 +648,12 @@ def extract_from_last_layer(model_path: str, save_path: str, last_layer_name: st
     output_names = [out.name for out in graph.output if "_InternalRetainedState" not in out.name]
 
     # Extract subgraph
-    onnx.utils.extract_model(model_path, save_path, input_names, output_names)
+    # onnx.utils.extract_model(model_path, save_path, input_names, output_names)
+    
+    model = onnx_ir.load(model_path)
+    model.graph = onnx_ir.convenience.extract(model.graph, input_names, output_names)
+    onnx_ir.save(model, save_path)
+    
     print(f"Subgraph saved to {save_path}")
 
 def collect_module_inputs(
@@ -708,73 +718,6 @@ def collect_module_inputs(
     for h in hooks:
         h.remove()
     return captured, first_layer
-
-def extract_model(
-    input_path: str | os.PathLike,
-    output_path: str | os.PathLike,
-    input_names: list[str],
-    output_names: list[str],
-    check_model: bool = True,
-    infer_shapes: bool = True,
-) -> None:
-    """Extracts sub-model from an ONNX model.
-
-    The sub-model is defined by the names of the input and output tensors *exactly*.
-
-    Note: For control-flow operators, e.g. If and Loop, the _boundary of sub-model_,
-    which is defined by the input and output tensors, should not _cut through_ the
-    subgraph that is connected to the _main graph_ as attributes of these operators.
-
-    Note: When the extracted model size is larger than 2GB, the extra data will be saved in "output_path.data".
-
-    Arguments:
-        input_path (str | os.PathLike): The path to original ONNX model.
-        output_path (str | os.PathLike): The path to save the extracted ONNX model.
-        input_names (list of string): The names of the input tensors that to be extracted.
-        output_names (list of string): The names of the output tensors that to be extracted.
-        check_model (bool): Whether to run model checker on the original model and the extracted model.
-        infer_shapes (bool): Whether to infer the shapes of the original model.
-    """
-    if not os.path.exists(input_path):
-        raise ValueError(f"Invalid input model path: {input_path}")
-    if not output_path:
-        raise ValueError("Output model path shall not be empty!")
-    if not input_names:
-        raise ValueError("Input tensor names shall not be empty!")
-    if not output_names:
-        raise ValueError("Output tensor names shall not be empty!")
-
-    if len(input_names) != len(set(input_names)):
-        raise ValueError("Duplicate names found in the input tensor names.")
-    if len(output_names) != len(set(output_names)):
-        raise ValueError("Duplicate names found in the output tensor names.")
-
-    if check_model:
-        onnx.checker.check_model(input_path)
-
-    if infer_shapes and os.path.getsize(input_path) > onnx.checker.MAXIMUM_PROTOBUF:
-        onnx.shape_inference.infer_shapes_path(input_path, output_path)
-        model = onnx.load(output_path)
-    elif infer_shapes:
-        model = onnx.load(input_path, load_external_data=False)
-        model = onnx.shape_inference.infer_shapes(model)
-        base_dir = os.path.dirname(input_path)
-        onnx.load_external_data_for_model(model, base_dir)
-    else:
-        model = onnx.load(input_path)
-
-    e = Extractor(model)
-    extracted = e.extract_model(input_names, output_names)
-
-    if extracted.ByteSize() > onnx.checker.MAXIMUM_PROTOBUF:
-        location = os.path.basename(output_path) + ".data"
-        onnx.save(extracted, output_path, save_as_external_data=True, location=location)
-    else:
-        onnx.save(extracted, output_path)
-
-    if check_model:
-        onnx.checker.check_model(output_path)
-
 
 def remove_all_forward_hooks(model: torch.nn.Module):
     for name, module in model.named_modules():
@@ -931,16 +874,18 @@ def stitch_model(model1, model2):
         for out in first_node.output: # only do this for first node for now, since we don't expect later nodes to be in common at all
             new_name = out if out not in model1_names else get_new_name(out, model1_names)
             model2_out_rename[out] = new_name
-            first_node.output[list(first_node.output).index(out)] = new_name
+            model2.graph.node[0].output[list(first_node.output).index(out)] = new_name
         
         # import ipdb; ipdb.set_trace()
 
-        for next_node in model2.graph.node:
+        for i, next_node in enumerate(model2.graph.node):
             for init in model2.graph.initializer:
                 if init.name in next_node.input:
                     new_name = model2_init_rename[init.name]
                     next_node.input[list(next_node.input).index(init.name)] = new_name
             model1.graph.node.append(next_node)
+
+        import ipdb; ipdb.set_trace()
         
         # add initializers from model2 to model1
         for init in model2.graph.initializer:
@@ -966,6 +911,17 @@ def stitch_model(model1, model2):
                 model1.graph.value_info.append(vi)
     else:
         raise ValueError(f"Stitching different onnx functions not yet implemented")
+
+def make_names_unique_in_graph(model, layer_idx):
+    model.graph = onnx.compose.add_prefix(model.graph, f"layer_{layer_idx}_", inplace=True)
+
+def stitch_model_clean(model1, model2):
+    import ipdb; ipdb.set_trace()
+    onnx.compose.merge_models(
+        model1,
+        model2,
+
+    )
 
 import time, os, psutil, threading
 from contextlib import contextmanager
