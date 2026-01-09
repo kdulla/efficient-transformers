@@ -709,6 +709,72 @@ def collect_module_inputs(
         h.remove()
     return captured, first_layer
 
+def extract_model(
+    input_path: str | os.PathLike,
+    output_path: str | os.PathLike,
+    input_names: list[str],
+    output_names: list[str],
+    check_model: bool = True,
+    infer_shapes: bool = True,
+) -> None:
+    """Extracts sub-model from an ONNX model.
+
+    The sub-model is defined by the names of the input and output tensors *exactly*.
+
+    Note: For control-flow operators, e.g. If and Loop, the _boundary of sub-model_,
+    which is defined by the input and output tensors, should not _cut through_ the
+    subgraph that is connected to the _main graph_ as attributes of these operators.
+
+    Note: When the extracted model size is larger than 2GB, the extra data will be saved in "output_path.data".
+
+    Arguments:
+        input_path (str | os.PathLike): The path to original ONNX model.
+        output_path (str | os.PathLike): The path to save the extracted ONNX model.
+        input_names (list of string): The names of the input tensors that to be extracted.
+        output_names (list of string): The names of the output tensors that to be extracted.
+        check_model (bool): Whether to run model checker on the original model and the extracted model.
+        infer_shapes (bool): Whether to infer the shapes of the original model.
+    """
+    if not os.path.exists(input_path):
+        raise ValueError(f"Invalid input model path: {input_path}")
+    if not output_path:
+        raise ValueError("Output model path shall not be empty!")
+    if not input_names:
+        raise ValueError("Input tensor names shall not be empty!")
+    if not output_names:
+        raise ValueError("Output tensor names shall not be empty!")
+
+    if len(input_names) != len(set(input_names)):
+        raise ValueError("Duplicate names found in the input tensor names.")
+    if len(output_names) != len(set(output_names)):
+        raise ValueError("Duplicate names found in the output tensor names.")
+
+    if check_model:
+        onnx.checker.check_model(input_path)
+
+    if infer_shapes and os.path.getsize(input_path) > onnx.checker.MAXIMUM_PROTOBUF:
+        onnx.shape_inference.infer_shapes_path(input_path, output_path)
+        model = onnx.load(output_path)
+    elif infer_shapes:
+        model = onnx.load(input_path, load_external_data=False)
+        model = onnx.shape_inference.infer_shapes(model)
+        base_dir = os.path.dirname(input_path)
+        onnx.load_external_data_for_model(model, base_dir)
+    else:
+        model = onnx.load(input_path)
+
+    e = Extractor(model)
+    extracted = e.extract_model(input_names, output_names)
+
+    if extracted.ByteSize() > onnx.checker.MAXIMUM_PROTOBUF:
+        location = os.path.basename(output_path) + ".data"
+        onnx.save(extracted, output_path, save_as_external_data=True, location=location)
+    else:
+        onnx.save(extracted, output_path)
+
+    if check_model:
+        onnx.checker.check_model(output_path)
+
 
 def remove_all_forward_hooks(model: torch.nn.Module):
     for name, module in model.named_modules():
