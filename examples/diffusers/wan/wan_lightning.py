@@ -13,7 +13,9 @@ from huggingface_hub import hf_hub_download
 from QEfficient import QEffWanPipeline
 
 # Load the pipeline
-pipeline = QEffWanPipeline.from_pretrained("Wan-AI/Wan2.2-T2V-A14B-Diffusers")
+pipeline = QEffWanPipeline.from_pretrained("Wan-AI/Wan2.2-T2V-A14B-Diffusers", num_hidden_layers=2)
+
+import ipdb; ipdb.set_trace()
 
 # Download the LoRAs
 high_noise_lora_path = hf_hub_download(

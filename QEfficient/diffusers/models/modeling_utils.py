@@ -378,36 +378,67 @@ def apply_qkv_blocking(
                 else:
                     real_kv_len = kv_block_positions[kv_block_idx + 1] - ki
 
-                k_block = k_g[:, :, ki : ki + real_kv_len, :]
-                v_block = v_g[:, :, ki : ki + real_kv_len, :]
+                k_block = k_g[:, :, ki : ki + real_kv_len, :]             
 
                 # Compute attention scores for current Q-K block
                 qkblock = torch.matmul(q_block, k_block.transpose(-2, -1)) * scale_factor
 
+                if qkblock.shape[-1] > 0:
+                    block_max = qkblock.max(dim=-1, keepdim=True).values
+                else:
+                    block_max = torch.full(
+                        (BS, NH, CL, 1),
+                        float(MIN_MASKED_ATTENTION_VALUE),
+                        dtype=query.dtype,
+                        device=query.device
+                    )
+
+                block_max_scalar = block_max.squeeze(-1)
+
+                skip_low_attention = torch.exp(block_max_scalar - running_max).max() < threshold_tensor
+
+                if not torch.onnx.is_in_onnx_export() and not torch.jit.is_tracing():
+                    if skip_low_attention.item():
+                        continue
+
+                v_block = v_g[:, :, ki : ki + real_kv_len, :]
+
                 # Online softmax: Update running maximum
-                prev_max = running_max.clone()
+                prev_max = running_max
                 if qkblock.shape[-1] == 0:
                     running_max = prev_max
                 else:
-                    running_max = torch.maximum(prev_max, torch.max(qkblock, dim=-1)[0])
+                    running_max_updated = torch.maximum(prev_max, torch.max(qkblock, dim=-1)[0])
 
                 # Calculate adjustment factor for numerical stability
                 delta_max = prev_max - running_max
                 curr_exp = torch.exp(qkblock - running_max.unsqueeze(-1))
 
                 # Online softmax: Update running sum of exponentials
-                prev_exp_sum = running_exp_sum.clone()
+                prev_exp_sum = running_exp_sum
                 curr_exp_sum = torch.einsum("bhqk->bhq", curr_exp)
-                running_exp_sum = prev_exp_sum * torch.exp(delta_max) + curr_exp_sum
+                running_exp_sum_updated = prev_exp_sum * torch.exp(delta_max) + curr_exp_sum
 
                 # Compute normalized attention weights for this block
                 inv_running_exp_sum = 1.0 / running_exp_sum
                 softmax_qkblock = curr_exp * inv_running_exp_sum.unsqueeze(-1)
 
                 # Online softmax: Update output with rescaling of previous blocks
-                prev_out = output_blocks.clone()
+                prev_out = output_blocks
                 rescale_factor = (prev_exp_sum * inv_running_exp_sum) * torch.exp(delta_max)
-                output_blocks = rescale_factor.unsqueeze(-1) * prev_out + torch.matmul(softmax_qkblock, v_block)
+                output_updated = rescale_factor.unsqueeze(-1) * prev_out + torch.matmul(softmax_qkblock, v_block)
+
+                if torch.onnx.is_in_onnx_export() or torch.jit.is_tracing():
+                    # skip_low_attention
+                    skip_low_mask = skip_low_attention.view(1, 1, 1).expand(batch_size, num_heads, seq_len)
+                    running_max = torch.where(skip_low_mask, prev_max, running_max_updated)
+                    running_exp_sum = torch.where(skip_low_mask, prev_exp_sum, running_exp_sum_updated)
+                    output_blocks = torch.where(skip_low_mask.unsqueeze(-1), prev_out, output_updated)
+
+                else:
+                    running_max = running_max_updated
+                    running_exp_sum = running_exp_sum_updated
+                    output_blocks = output_updated
 
             q_output_list.append(output_blocks)
 
