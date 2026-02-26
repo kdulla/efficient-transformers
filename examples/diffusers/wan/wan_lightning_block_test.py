@@ -10,9 +10,10 @@ from diffusers.loaders.lora_conversion_utils import _convert_non_diffusers_wan_l
 from diffusers.utils import export_to_video
 from huggingface_hub import hf_hub_download
 
-from QEfficient import QEffWanPipeline
+from QEfficient import QEffWanPipeline, QEffWanTransformer3DModel
 
 # Load the pipeline
+
 pipeline = QEffWanPipeline.from_pretrained("Wan-AI/Wan2.2-T2V-A14B-Diffusers")
 
 # Download the LoRAs
@@ -43,6 +44,13 @@ pipeline.transformer.model.transformer_low.set_adapters(["low_noise"], weights=[
 
 
 prompt = "In a warmly lit living room, an elderly man with gray hair sits in a wooden armchair adorned with a blue cushion. He wears a gray cardigan over a white shirt, engrossed in reading a book. As he turns the pages, he subtly adjusts his posture, ensuring his glasses stay in place. He then removes his glasses, holding them in his hand, and turns his head to the right, maintaining his grip on the book. The soft glow of a bedside lamp bathes the scene, creating a calm and serene atmosphere, with gentle shadows enhancing the intimate setting."
+
+# blocking variables
+os.environ["ATTENTION_BLOCKING_MODE"] = "hqkv"
+os.environ["head_block_size"] = "1"
+os.environ["num_kv_blocks"] = "16"
+os.environ["num_q_blocks"] = "2"
+os.environ["skip_threshold"] = "100.0"
 
 output = pipeline(
     prompt=prompt,

@@ -339,6 +339,14 @@ def apply_qkv_blocking(
 
     head_outputs = []
 
+    skip_threshold = float(os.environ.get("skip_threshold", 0.0)) or None
+
+    use_skip_threshold = skip_threshold is not None and skip_threshold > 0
+    if use_skip_threshold:
+        threshold_tensor = torch.tensor(skip_threshold, dtype=query.dtype, device=query.device)
+    else:
+        threshold_tensor = torch.tensor(0.0, dtype=query.dtype, device=query.device)
+
     # Process attention heads in blocks to reduce memory usage
     for head_block_idx in range(num_head_blocks):
         h_start = head_block_idx * head_block_size

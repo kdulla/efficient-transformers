@@ -1,4 +1,4 @@
-# -----------------------------------------------------------------------------
+c# -----------------------------------------------------------------------------
 #
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause
@@ -11,9 +11,10 @@ This module provides an optimized implementation of the WAN pipeline
 for high-performance text-to-video generation on Qualcomm AI hardware.
 The pipeline supports WAN 2.2 architectures with unified transformer.
 
-TODO: 1. Update umt5 to Qaic; present running on cpu
+TODO: 1. Update Vae, umt5 to Qaic; present running on cpu
 """
 
+import math
 import os
 import time
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -21,15 +22,13 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import numpy as np
 import torch
 from diffusers import WanPipeline
-from tqdm import tqdm
+from diffusers.video_processor import VideoProcessor
 
-from QEfficient.diffusers.pipelines.pipeline_module import QEffVAE, QEffWanUnifiedTransformer
+from QEfficient.diffusers.pipelines.pipeline_module import QEffWanUnifiedTransformer, QEffWanUnifiedWrapper
 from QEfficient.diffusers.pipelines.pipeline_utils import (
     ONNX_SUBFUNCTION_MODULE,
     ModulePerf,
     QEffPipelineOutput,
-    QEffWanUnifiedWrapper,
-    calculate_latent_dimensions_with_frames,
     compile_modules_parallel,
     compile_modules_sequential,
     config_manager,
@@ -40,9 +39,9 @@ from QEfficient.utils import constants
 from QEfficient.utils.logging_utils import logger
 
 
-class QEffWanPipeline:
+class QEffWanImageToVideoPipeline:
     """
-    QEfficient-optimized WAN pipeline for high-performance text-to-video generation on Qualcomm AI hardware.
+    QEfficient-optimized WAN pipeline for high-performance image-to-video generation on Qualcomm AI hardware.
 
     This pipeline provides an optimized implementation of the WAN diffusion model
     specifically designed for deployment on Qualcomm AI Cloud (QAIC) devices. It extends the original
@@ -50,12 +49,15 @@ class QEffWanPipeline:
     and compiled into Qualcomm Program Container (QPC) files for efficient video generation.
 
     The pipeline supports the complete WAN workflow including:
+    - CLIPVisionModel image encoder
     - UMT5 text encoding for rich semantic understanding
     - Unified transformer architecture: Combines multiple transformer stages into a single optimized model
     - VAE decoding for final video output
     - Performance monitoring and hardware optimization
 
     Attributes:
+        image_processor: CLIPImageProcessor for pre-processing utilities
+        image_encoder: ClipVisionModel for embedding
         text_encoder: UMT5 text encoder for semantic text understanding (TODO: QEfficient optimization)
         unified_wrapper (QEffWanUnifiedWrapper): Wrapper combining transformer stages
         transformer (QEffWanUnifiedTransformer): Optimized unified transformer for denoising
@@ -64,9 +66,10 @@ class QEffWanPipeline:
         model (WanPipeline): Original HuggingFace WAN model reference
         tokenizer: Text tokenizer for preprocessing
         scheduler: Diffusion scheduler for timestep management
+        video_processor (VideoProcessor): Video post-processing utilities
 
     Example:
-        >>> from QEfficient.diffusers.pipelines.wan import QEffWanPipeline
+        >>> from QEfficient.diffusers.pipelines.wan import QEffWanImageToVideoPipeline
         >>> pipeline = QEffWanPipeline.from_pretrained("path/to/wan/model")
         >>> videos = pipeline(
         ...     prompt="A cat playing in a garden",
@@ -102,26 +105,39 @@ class QEffWanPipeline:
         # Text encoder (TODO: Replace with QEfficient UMT5 optimization)
         self.text_encoder = model.text_encoder
 
+        # Image encoder
+        self.image_encoder = QEffmodel.text_encoder
+
         # Create unified transformer wrapper combining dual-stage models(high, low noise DiTs)
         self.unified_wrapper = QEffWanUnifiedWrapper(model.transformer, model.transformer_2)
         self.transformer = QEffWanUnifiedTransformer(self.unified_wrapper)
 
         # VAE decoder for latent-to-video conversion
-        self.vae_decoder = QEffVAE(model.vae, "decoder")
+        self.vae_decode = model.vae
+
         # Store all modules in a dictionary for easy iteration during export/compile
-        # TODO: add text encoder on QAIC
-        self.modules = {"transformer": self.transformer, "vae_decoder": self.vae_decoder}
+        self.modules = {"transformer": self.transformer}
 
         # Copy tokenizers and scheduler from the original model
         self.tokenizer = model.tokenizer
         self.text_encoder.tokenizer = model.tokenizer
         self.scheduler = model.scheduler
 
-        self.vae_decoder.model.forward = lambda latent_sample, return_dict: self.vae_decoder.model.decode(
-            latent_sample, return_dict
+        # Store configuration parameters directly
+        self.boundary_ratio = self.model.config.boundary_ratio
+        self.expand_timesteps = self.model.config.expand_timesteps
+
+        # Configure VAE scale factors for video processing
+        self.vae_scale_factor_temporal = (
+            self.vae_decode.config.scale_factor_temporal if hasattr(self.vae_decode, "config") else 4
+        )
+        self.vae_scale_factor_spatial = (
+            self.vae_decode.config.scale_factor_spatial if hasattr(self.vae_decode, "config") else 8
         )
 
-        self.vae_decoder.get_onnx_params = self.vae_decoder.get_video_onnx_params
+        # Initialize video processor for frame handling and post-processing
+        self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
+
         # Extract patch dimensions from transformer configuration
         _, self.patch_height, self.patch_width = self.transformer.model.config.patch_size
 
@@ -189,8 +205,67 @@ class QEffWanPipeline:
             **kwargs,
         )
 
+    def configure_height_width_cl_latents_hw(self, height, width, num_frames):
+        """
+        Configure pipeline dimensions and calculate compressed latent parameters.
+
+        This method sets the target video dimensions and calculates the corresponding
+        compressed latent dimension (cl) and latent space dimensions for buffer allocation
+        and transformer processing.
+
+        Args:
+            height (int): Target video height in pixels
+            width (int): Target video width in pixels
+            num_frames (int): Target video frames in pixels
+
+        Note:
+            - Updates self.height, self.width, self.cl, self.latent_height, self.latent_width
+            - Used internally before compilation and inference
+        """
+        self.height = height
+        self.width = width
+        self.cl, self.latent_height, self.latent_width = self.calculate_compressed_latent_dimension(
+            height, width, num_frames
+        )
+
+    def calculate_compressed_latent_dimension(self, height, width, num_frames):
+        """
+        Calculate the compressed latent dimension for transformer buffer allocation.
+
+        This method computes the compressed sequence length (cl) that the transformer
+        will process, based on the target video dimensions, VAE scale factors, and
+        patch sizes. This is crucial for proper buffer allocation in QAIC inference.
+
+        Args:
+            height (int): Target video height in pixels
+            width (int): Target video width in pixels
+            num_frames (int): Target video frames in pixels
+
+        Returns:
+            tuple: (cl, latent_height, latent_width)
+                - cl (int): Compressed latent dimension for transformer input
+                - latent_height (int): Height in latent space
+                - latent_width (int): Width in latent space
+
+        Mathematical Formula:
+            latent_height = height // vae_scale_factor_spatial
+            latent_width = width // vae_scale_factor_spatial
+            latent_frames =  math.ceil(num_frames / vae_scale_factor_temporal)
+            cl = (latent_height // patch_height) * (latent_width // patch_width) * latent_frames
+
+        """
+        # Calculate latent space dimensions after VAE encoding
+        latent_height = height // self.vae_scale_factor_spatial
+        latent_width = width // self.vae_scale_factor_spatial
+        latent_frames = math.ceil(num_frames / self.vae_scale_factor_temporal)
+        cl = (latent_height // self.patch_height * latent_width // self.patch_width) * latent_frames
+        return cl, latent_height, latent_width
+
     def export(
         self,
+        height: int = constants.WAN_ONNX_EXPORT_HEIGHT_180P,
+        width: int = constants.WAN_ONNX_EXPORT_WIDTH_180P,
+        num_frames: int = constants.WAN_ONNX_EXPORT_FRAMES,
         export_dir: Optional[str] = None,
         use_onnx_subfunctions: bool = False,
     ) -> str:
@@ -203,6 +278,11 @@ class QEffWanPipeline:
         compilation to QPC format for efficient inference on QAIC hardware.
 
         Args:
+            height (int, default=192): Export height in pixels. Users can export at low
+                resolution and compile for higher resolution later for flexibility.
+            width (int, default=320): Export width in pixels. Should maintain aspect ratio
+                appropriate for the target use case.
+            num_frames (int, default=81): frames in pixel space
             export_dir (str, optional): Target directory for saving ONNX model files. If None,
                 uses the default export directory structure. The directory will be created
                 if it doesn't exist.
@@ -221,15 +301,27 @@ class QEffWanPipeline:
         Example:
             >>> pipeline = QEffWanPipeline.from_pretrained("path/to/wan/model")
             >>> export_path = pipeline.export(
+            ...     height=480,
+            ...     width=832,
             ...     export_dir="/path/to/export",
             ...     use_onnx_subfunctions=True
             ... )
         """
+        # Calculate compressed latent dimensions for export configuration
+        export_cl, export_latent_height, export_latent_width = self.calculate_compressed_latent_dimension(
+            height, width, num_frames
+        )
 
         # Export each module with video-specific parameters
-        for module_name, module_obj in tqdm(self.modules.items(), desc="Exporting modules", unit="module"):
+        for module_name, module_obj in self.modules.items():
             # Get ONNX export configuration with video dimensions
-            example_inputs, dynamic_axes, output_names = module_obj.get_onnx_params()
+            example_inputs, dynamic_axes, output_names = module_obj.get_onnx_params(
+                batch_size=1,
+                seq_length=512,  # Text sequence length
+                cl=export_cl,  # Compressed latent dimension
+                latent_height=export_latent_height,
+                latent_width=export_latent_width,
+            )
 
             # Prepare export parameters
             export_params = {
@@ -243,7 +335,11 @@ class QEffWanPipeline:
             if use_onnx_subfunctions and module_name in ONNX_SUBFUNCTION_MODULE:
                 export_params["use_onnx_subfunctions"] = True
 
+            # Export with performance timing
+            start_time = time.perf_counter()
             module_obj.export(**export_params)
+            end_time = time.perf_counter()
+            print(f"{module_name} export took {end_time - start_time:.2f} seconds")
 
     @staticmethod
     def get_default_config_path():
@@ -259,9 +355,6 @@ class QEffWanPipeline:
         self,
         compile_config: Optional[str] = None,
         parallel: bool = False,
-        height: int = constants.WAN_ONNX_EXPORT_HEIGHT_180P,
-        width: int = constants.WAN_ONNX_EXPORT_WIDTH_180P,
-        num_frames: int = constants.WAN_ONNX_EXPORT_FRAMES,
         use_onnx_subfunctions: bool = False,
     ) -> str:
         """
@@ -277,9 +370,6 @@ class QEffWanPipeline:
             parallel (bool, default=False): Compilation mode selection:
                 - True: Compile modules in parallel using ThreadPoolExecutor for faster processing
                 - False: Compile modules sequentially for lower resource usage
-            height (int, default=192): Target image height in pixels.
-            width (int, default=320): Target image width in pixels.
-            num_frames (int, deafult=81) : Target num of frames in pixel space
             use_onnx_subfunctions (bool, default=False): Whether to export models with ONNX
                 subfunctions before compilation if not already exported.
 
@@ -292,361 +382,52 @@ class QEffWanPipeline:
         Example:
             >>> pipeline = QEffWanPipeline.from_pretrained("path/to/wan/model")
             >>> # Sequential compilation with default config
-            >>> pipeline.compile(height=480, width=832, num_frames=81)
+            >>> pipeline.compile(height=480, width=832)
             >>>
             >>> # Parallel compilation with custom config
             >>> pipeline.compile(
             ...     compile_config="/path/to/custom_config.json",
-            ...     parallel=True,
-            ...     height=480,
-            ...     width=832,
-            ...     num_frames=81
+            ...     parallel=True
             ... )
         """
         # Ensure all modules are exported to ONNX before compilation
         if any(
             path is None
             for path in [
+                # self.text_encoder.onnx_path,  # TODO: Enable when UMT5 is optimized
                 self.transformer.onnx_path,
-                self.vae_decoder.onnx_path,
+                # self.vae_decode.onnx_path,  # TODO: Enable when VAE is optimized
             ]
         ):
             self.export(use_onnx_subfunctions=use_onnx_subfunctions)
 
         # Load compilation configuration
-        config_manager(self, config_source=compile_config, use_onnx_subfunctions=use_onnx_subfunctions)
+        config_manager(self, config_source=compile_config)
 
-        # Configure pipeline dimensions and calculate compressed latent parameters
-        cl, latent_height, latent_width, latent_frames = calculate_latent_dimensions_with_frames(
-            height,
-            width,
-            num_frames,
-            self.model.vae.config.scale_factor_spatial,
-            self.model.vae.config.scale_factor_temporal,
-            self.patch_height,
-            self.patch_width,
-        )
         # Prepare dynamic specialization updates based on video dimensions
         specialization_updates = {
-            "transformer": [
-                # high noise
-                {
-                    "cl": cl,  # Compressed latent dimension
-                    "latent_height": latent_height,  # Latent space height
-                    "latent_width": latent_width,  # Latent space width
-                    "latent_frames": latent_frames,  # Latent frames
-                },
-                # low noise
-                {
-                    "cl": cl,  # Compressed latent dimension
-                    "latent_height": latent_height,  # Latent space height
-                    "latent_width": latent_width,  # Latent space width
-                    "latent_frames": latent_frames,  # Latent frames
-                },
-            ],
-            "vae_decoder": {
-                "latent_frames": latent_frames,
-                "latent_height": latent_height,
-                "latent_width": latent_width,
-            },
+            "transformer": {
+                "cl": self.cl,  # Compressed latent dimension
+                "latent_height": self.latent_height,  # Latent space height
+                "latent_width": self.latent_width,  # Latent space width
+            }
         }
 
         # Use generic utility functions for compilation
-        logger.warning('For VAE compilation use QAIC_COMPILER_OPTS_UNSUPPORTED="-aic-hmx-conv3d" ')
         if parallel:
             compile_modules_parallel(self.modules, self.custom_config, specialization_updates)
         else:
             compile_modules_sequential(self.modules, self.custom_config, specialization_updates)
 
-    def __call_original__(
+    def encode_image(
         self,
-        prompt: str | list[str] = None,
-        negative_prompt: str | list[str] = None,
-        height: int = 480,
-        width: int = 832,
-        num_frames: int = 81,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 5.0,
-        guidance_scale_2: float | None = None,
-        num_videos_per_prompt: int | None = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        latents: torch.Tensor | None = None,
-        prompt_embeds: torch.Tensor | None = None,
-        negative_prompt_embeds: torch.Tensor | None = None,
-        output_type: str | None = "np",
-        return_dict: bool = True,
-        attention_kwargs: dict[str, Any] | None = None,
-        callback_on_step_end: Callable[[int, int], None] | PipelineCallback | MultiPipelineCallbacks | None = None,
-        callback_on_step_end_tensor_inputs: list[str] = ["latents"],
-        max_sequence_length: int = 512,
+        image: PipelineImageInput,
+        device: Optional[torch.device] = None,
     ):
-        r"""
-        The call function to the pipeline for generation taken from github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/wan/pipeline_wan.py
-
-        Args:
-            prompt (`str` or `list[str]`, *optional*):
-                The prompt or prompts to guide the image generation. If not defined, pass `prompt_embeds` instead.
-            negative_prompt (`str` or `list[str]`, *optional*):
-                The prompt or prompts to avoid during image generation. If not defined, pass `negative_prompt_embeds`
-                instead. Ignored when not using guidance (`guidance_scale` < `1`).
-            height (`int`, defaults to `480`):
-                The height in pixels of the generated image.
-            width (`int`, defaults to `832`):
-                The width in pixels of the generated image.
-            num_frames (`int`, defaults to `81`):
-                The number of frames in the generated video.
-            num_inference_steps (`int`, defaults to `50`):
-                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
-                expense of slower inference.
-            guidance_scale (`float`, defaults to `5.0`):
-                Guidance scale as defined in [Classifier-Free Diffusion
-                Guidance](https://huggingface.co/papers/2207.12598). `guidance_scale` is defined as `w` of equation 2.
-                of [Imagen Paper](https://huggingface.co/papers/2205.11487). Guidance scale is enabled by setting
-                `guidance_scale > 1`. Higher guidance scale encourages to generate images that are closely linked to
-                the text `prompt`, usually at the expense of lower image quality.
-            guidance_scale_2 (`float`, *optional*, defaults to `None`):
-                Guidance scale for the low-noise stage transformer (`transformer_2`). If `None` and the pipeline's
-                `boundary_ratio` is not None, uses the same value as `guidance_scale`. Only used when `transformer_2`
-                and the pipeline's `boundary_ratio` are not None.
-            num_videos_per_prompt (`int`, *optional*, defaults to 1):
-                The number of images to generate per prompt.
-            generator (`torch.Generator` or `list[torch.Generator]`, *optional*):
-                A [`torch.Generator`](https://pytorch.org/docs/stable/generated/torch.Generator.html) to make
-                generation deterministic.
-            latents (`torch.Tensor`, *optional*):
-                Pre-generated noisy latents sampled from a Gaussian distribution, to be used as inputs for image
-                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
-                tensor is generated by sampling using the supplied random `generator`.
-            prompt_embeds (`torch.Tensor`, *optional*):
-                Pre-generated text embeddings. Can be used to easily tweak text inputs (prompt weighting). If not
-                provided, text embeddings are generated from the `prompt` input argument.
-            output_type (`str`, *optional*, defaults to `"np"`):
-                The output format of the generated image. Choose between `PIL.Image` or `np.array`.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`WanPipelineOutput`] instead of a plain tuple.
-            attention_kwargs (`dict`, *optional*):
-                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
-                `self.processor` in
-                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
-            callback_on_step_end (`Callable`, `PipelineCallback`, `MultiPipelineCallbacks`, *optional*):
-                A function or a subclass of `PipelineCallback` or `MultiPipelineCallbacks` that is called at the end of
-                each denoising step during the inference. with the following arguments: `callback_on_step_end(self:
-                DiffusionPipeline, step: int, timestep: int, callback_kwargs: Dict)`. `callback_kwargs` will include a
-                list of all tensors as specified by `callback_on_step_end_tensor_inputs`.
-            callback_on_step_end_tensor_inputs (`list`, *optional*):
-                The list of tensor inputs for the `callback_on_step_end` function. The tensors specified in the list
-                will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
-                `._callback_tensor_inputs` attribute of your pipeline class.
-            max_sequence_length (`int`, defaults to `512`):
-                The maximum sequence length of the text encoder. If the prompt is longer than this, it will be
-                truncated. If the prompt is shorter, it will be padded to this length.
-
-        Examples:
-
-        Returns:
-            [`~WanPipelineOutput`] or `tuple`:
-                If `return_dict` is `True`, [`WanPipelineOutput`] is returned, otherwise a `tuple` is returned where
-                the first element is a list with the generated images and the second element is a list of `bool`s
-                indicating whether the corresponding generated image contains "not-safe-for-work" (nsfw) content.
-        """
-
-        if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
-            callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
-
-        # 1. Check inputs. Raise error if not correct
-        self.check_inputs(
-            prompt,
-            negative_prompt,
-            height,
-            width,
-            prompt_embeds,
-            negative_prompt_embeds,
-            callback_on_step_end_tensor_inputs,
-            guidance_scale_2,
-        )
-
-        if num_frames % self.vae_scale_factor_temporal != 1:
-            logger.warning(
-                f"`num_frames - 1` has to be divisible by {self.vae_scale_factor_temporal}. Rounding to the nearest number."
-            )
-            num_frames = num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
-        num_frames = max(num_frames, 1)
-
-        patch_size = (
-            self.transformer.config.patch_size
-            if self.transformer is not None
-            else self.transformer_2.config.patch_size
-        )
-        h_multiple_of = self.vae_scale_factor_spatial * patch_size[1]
-        w_multiple_of = self.vae_scale_factor_spatial * patch_size[2]
-        calc_height = height // h_multiple_of * h_multiple_of
-        calc_width = width // w_multiple_of * w_multiple_of
-        if height != calc_height or width != calc_width:
-            logger.warning(
-                f"`height` and `width` must be multiples of ({h_multiple_of}, {w_multiple_of}) for proper patchification. "
-                f"Adjusting ({height}, {width}) -> ({calc_height}, {calc_width})."
-            )
-            height, width = calc_height, calc_width
-
-        if self.config.boundary_ratio is not None and guidance_scale_2 is None:
-            guidance_scale_2 = guidance_scale
-
-        self._guidance_scale = guidance_scale
-        self._guidance_scale_2 = guidance_scale_2
-        self._attention_kwargs = attention_kwargs
-        self._current_timestep = None
-        self._interrupt = False
-
-        device = self._execution_device
-
-        # 2. Define call parameters
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
-        else:
-            batch_size = prompt_embeds.shape[0]
-
-        # 3. Encode input prompt
-        prompt_embeds, negative_prompt_embeds = self.encode_prompt(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            do_classifier_free_guidance=self.do_classifier_free_guidance,
-            num_videos_per_prompt=num_videos_per_prompt,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            max_sequence_length=max_sequence_length,
-            device=device,
-        )
-
-        transformer_dtype = self.transformer.dtype if self.transformer is not None else self.transformer_2.dtype
-        prompt_embeds = prompt_embeds.to(transformer_dtype)
-        if negative_prompt_embeds is not None:
-            negative_prompt_embeds = negative_prompt_embeds.to(transformer_dtype)
-
-        # 4. Prepare timesteps
-        self.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps = self.scheduler.timesteps
-
-        # 5. Prepare latent variables
-        num_channels_latents = (
-            self.transformer.config.in_channels
-            if self.transformer is not None
-            else self.transformer_2.config.in_channels
-        )
-        latents = self.prepare_latents(
-            batch_size * num_videos_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            num_frames,
-            torch.float32,
-            device,
-            generator,
-            latents,
-        )
-
-        mask = torch.ones(latents.shape, dtype=torch.float32, device=device)
-
-        # 6. Denoising loop
-        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-        self._num_timesteps = len(timesteps)
-
-        if self.config.boundary_ratio is not None:
-            boundary_timestep = self.config.boundary_ratio * self.scheduler.config.num_train_timesteps
-        else:
-            boundary_timestep = None
-
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
-                if self.interrupt:
-                    continue
-
-                self._current_timestep = t
-
-                if boundary_timestep is None or t >= boundary_timestep:
-                    # wan2.1 or high-noise stage in wan2.2
-                    current_model = self.transformer
-                    current_guidance_scale = guidance_scale
-                else:
-                    # low-noise stage in wan2.2
-                    current_model = self.transformer_2
-                    current_guidance_scale = guidance_scale_2
-
-                latent_model_input = latents.to(transformer_dtype)
-                if self.config.expand_timesteps:
-                    # seq_len: num_latent_frames * latent_height//2 * latent_width//2
-                    temp_ts = (mask[0][0][:, ::2, ::2] * t).flatten()
-                    # batch_size, seq_len
-                    timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
-                else:
-                    timestep = t.expand(latents.shape[0])
-
-                with current_model.cache_context("cond"):
-                    noise_pred = current_model(
-                        hidden_states=latent_model_input,
-                        timestep=timestep,
-                        encoder_hidden_states=prompt_embeds,
-                        attention_kwargs=attention_kwargs,
-                        return_dict=False,
-                    )[0]
-
-                if self.do_classifier_free_guidance:
-                    with current_model.cache_context("uncond"):
-                        noise_uncond = current_model(
-                            hidden_states=latent_model_input,
-                            timestep=timestep,
-                            encoder_hidden_states=negative_prompt_embeds,
-                            attention_kwargs=attention_kwargs,
-                            return_dict=False,
-                        )[0]
-                    noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
-
-                # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-
-                if callback_on_step_end is not None:
-                    callback_kwargs = {}
-                    for k in callback_on_step_end_tensor_inputs:
-                        callback_kwargs[k] = locals()[k]
-                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
-
-                    latents = callback_outputs.pop("latents", latents)
-                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-                    negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
-
-                # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
-
-                if XLA_AVAILABLE:
-                    xm.mark_step()
-
-        self._current_timestep = None
-
-        if not output_type == "latent":
-            latents = latents.to(self.vae.dtype)
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, self.vae.config.z_dim, 1, 1, 1)
-                .to(latents.device, latents.dtype)
-            )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-                latents.device, latents.dtype
-            )
-            latents = latents / latents_std + latents_mean
-            video = self.vae.decode(latents, return_dict=False)[0]
-            video = self.video_processor.postprocess_video(video, output_type=output_type)
-        else:
-            video = latents
-
-        # Offload all models
-        self.maybe_free_model_hooks()
-
-        return QEffPipelineOutput(
-            pipeline_module=[],
-            images=video,
-        )
+        device = device or self._execution_device
+        image = self.image_processor(images=image, return_tensors="pt").to(device)
+        image_embeds = self.image_encoder(**image, output_hidden_states=True)
+        return image_embeds.hidden_states[-2]
 
     def __call__(
         self,
@@ -672,7 +453,6 @@ class QEffWanPipeline:
         custom_config_path: Optional[str] = None,
         use_onnx_subfunctions: bool = False,
         parallel_compile: bool = True,
-        run_on_gpu: bool = False,
     ):
         """
         Generate videos from text prompts using the QEfficient-optimized WAN pipeline on QAIC hardware.
@@ -742,32 +522,15 @@ class QEffWanPipeline:
         """
         device = "cpu"
 
-        if run_on_gpu:
-            return self.__call_original__(prompt=prompt,
-                                          negative_prompt=negative_prompt,
-                                          height=height,
-                                          width=width,
-                                          num_frames=num_frames,
-                                          num_inference_steps=num_inference_steps,
-                                          guidance_scale=guidance_scale,
-                                          guidance_scale_2=guidance_scale_2,
-                                          num_videos_per_prompt=num_videos_per_prompt,
-                                          generator=generator,
-                                          latents=latents,
-                                          prompt_embeds=prompt_embeds,
-                                          negative_prompt_embeds=negative_prompt_embeds,
-                                          output_type=output_type,
-                                          return_dict=return_dict,
-                                          attention_kwargs=attention_kwargs)
+        # Configure pipeline dimensions and calculate compressed latent parameters
+        # TODO : move to utils
+        self.configure_height_width_cl_latents_hw(height, width, num_frames)
 
         # Compile models with custom configuration if needed
         self.compile(
             compile_config=custom_config_path,
             parallel=parallel_compile,
             use_onnx_subfunctions=use_onnx_subfunctions,
-            height=height,
-            width=width,
-            num_frames=num_frames,
         )
 
         # Set device IDs for all modules based on configuration
@@ -786,17 +549,14 @@ class QEffWanPipeline:
         )
 
         # Ensure num_frames satisfies temporal divisibility requirements
-        if num_frames % self.model.vae.config.scale_factor_temporal != 1:
+        if num_frames % self.vae_scale_factor_temporal != 1:
             logger.warning(
-                f"`num_frames - 1` has to be divisible by {self.model.vae.config.scale_factor_temporal}. Rounding to the nearest number."
+                f"`num_frames - 1` has to be divisible by {self.vae_scale_factor_temporal}. Rounding to the nearest number."
             )
-            num_frames = (
-                num_frames // self.model.vae.config.scale_factor_temporal * self.model.vae.config.scale_factor_temporal
-                + 1
-            )
+            num_frames = num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
         num_frames = max(num_frames, 1)
 
-        if self.model.config.boundary_ratio is not None and guidance_scale_2 is None:
+        if self.boundary_ratio is not None and guidance_scale_2 is None:
             guidance_scale_2 = guidance_scale
 
         # Initialize pipeline state
@@ -816,6 +576,7 @@ class QEffWanPipeline:
 
         # Step 3: Encode input prompts using UMT5 text encoder
         # TODO: Update UMT5 on QAIC
+        start_encoder_time = time.perf_counter()
         prompt_embeds, negative_prompt_embeds = self.model.encode_prompt(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -826,6 +587,8 @@ class QEffWanPipeline:
             max_sequence_length=max_sequence_length,
             device=device,
         )
+        end_encoder_time = time.perf_counter()
+        text_encoder_perf = end_encoder_time - start_encoder_time
 
         # Convert embeddings to transformer dtype for compatibility
         transformer_dtype = self.transformer.model.transformer_high.dtype
@@ -859,8 +622,8 @@ class QEffWanPipeline:
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
 
         # Calculate boundary timestep for stage switching in WAN 2.2
-        if self.model.config.boundary_ratio is not None:
-            boundary_timestep = self.model.config.boundary_ratio * self.scheduler.config.num_train_timesteps
+        if self.boundary_ratio is not None:
+            boundary_timestep = self.boundary_ratio * self.scheduler.config.num_train_timesteps
         else:
             boundary_timestep = None
 
@@ -870,21 +633,11 @@ class QEffWanPipeline:
                 str(self.transformer.qpc_path), device_ids=self.transformer.device_ids
             )
 
-        # Calculate compressed latent dimension for transformer buffer allocation
-        cl, _, _, _ = calculate_latent_dimensions_with_frames(
-            height,
-            width,
-            num_frames,
-            self.model.vae.config.scale_factor_spatial,
-            self.model.vae.config.scale_factor_temporal,
-            self.patch_height,
-            self.patch_width,
-        )
         # Allocate output buffer for QAIC inference
         output_buffer = {
             "output": np.random.rand(
                 batch_size,
-                cl,  # Compressed latent dimension
+                self.cl,  # Compressed latent dimension
                 constants.WAN_DIT_OUT_CHANNELS,
             ).astype(np.int32),
         }
@@ -915,7 +668,7 @@ class QEffWanPipeline:
                 latent_model_input = latents.to(transformer_dtype)
 
                 # Handle timestep expansion for temporal consistency
-                if self.model.config.expand_timesteps:
+                if self.expand_timesteps:
                     # Expand timesteps spatially for better temporal modeling
                     temp_ts = (mask[0][0][:, ::2, ::2] * t).flatten()
                     timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
@@ -1044,45 +797,36 @@ class QEffWanPipeline:
         # Step 9: Decode latents to video
         if not output_type == "latent":
             # Prepare latents for VAE decoding
-            latents = latents.to(self.vae_decoder.model.dtype)
+            latents = latents.to(self.vae_decode.dtype)
 
             # Apply VAE normalization (denormalization)
             latents_mean = (
-                torch.tensor(self.vae_decoder.model.config.latents_mean)
-                .view(1, self.vae_decoder.model.config.z_dim, 1, 1, 1)
+                torch.tensor(self.vae_decode.config.latents_mean)
+                .view(1, self.vae_decode.config.z_dim, 1, 1, 1)
                 .to(latents.device, latents.dtype)
             )
-            latents_std = 1.0 / torch.tensor(self.vae_decoder.model.config.latents_std).view(
-                1, self.vae_decoder.model.config.z_dim, 1, 1, 1
+            latents_std = 1.0 / torch.tensor(self.vae_decode.config.latents_std).view(
+                1, self.vae_decode.config.z_dim, 1, 1, 1
             ).to(latents.device, latents.dtype)
             latents = latents / latents_std + latents_mean
 
-            # Initialize VAE decoder inference session
-            if self.vae_decoder.qpc_session is None:
-                self.vae_decoder.qpc_session = QAICInferenceSession(
-                    str(self.vae_decoder.qpc_path), device_ids=self.vae_decoder.device_ids
-                )
-
-            # Allocate output buffer for VAE decoder
-            output_buffer = {"sample": np.random.rand(batch_size, 3, num_frames, height, width).astype(np.int32)}
-
-            inputs = {"latent_sample": latents.numpy()}
-
+            # TODO: Enable VAE on QAIC
+            # VAE Decode latents to video using CPU (temporary)
             start_decode_time = time.perf_counter()
-            video = self.vae_decoder.qpc_session.run(inputs)
+            video = self.model.vae.decode(latents, return_dict=False)[0]  # CPU fallback
             end_decode_time = time.perf_counter()
-            vae_decoder_perf = end_decode_time - start_decode_time
+            vae_decode_perf = end_decode_time - start_decode_time
 
             # Post-process video for output
-            video_tensor = torch.from_numpy(video["sample"])
-            video = self.model.video_processor.postprocess_video(video_tensor)
+            video = self.video_processor.postprocess_video(video.detach())
         else:
             video = latents
 
         # Step 10: Collect performance metrics
         perf_data = {
+            "umt5": text_encoder_perf,  # UMT5 text encoder (CPU)
             "transformer": transformer_perf,  # Unified transformer (QAIC)
-            "vae_decoder": vae_decoder_perf,
+            "vae_decoder": vae_decode_perf,  # VAE decoder (CPU)
         }
 
         # Build performance metrics for output
