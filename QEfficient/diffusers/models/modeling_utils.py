@@ -343,9 +343,9 @@ def apply_qkv_blocking(
 
     use_skip_threshold = skip_threshold is not None and skip_threshold > 0
     if use_skip_threshold:
-        threshold_tensor = torch.tensor(skip_threshold, dtype=query.dtype, device=query.device)
+        threshold_tensor = torch.tensor(skip_threshold, dtype=q.dtype, device=q.device)
     else:
-        threshold_tensor = torch.tensor(0.0, dtype=query.dtype, device=query.device)
+        threshold_tensor = torch.tensor(0.0, dtype=q.dtype, device=q.device)
 
     # Process attention heads in blocks to reduce memory usage
     for head_block_idx in range(num_head_blocks):
@@ -405,8 +405,12 @@ def apply_qkv_blocking(
 
                 skip_low_attention = torch.exp(block_max_scalar - running_max).max() < threshold_tensor
 
+                # import ipdb; ipdb.set_trace()
+
                 if not torch.onnx.is_in_onnx_export() and not torch.jit.is_tracing():
+                    os.environ["num_blocks_total"] = str(int(os.environ.get("num_blocks_total", 0)) + 1)
                     if skip_low_attention.item():
+                        os.environ["num_blocks_skipped"] = str(int(os.environ.get("num_blocks_skipped", 0)) + 1)
                         continue
 
                 v_block = v_g[:, :, ki : ki + real_kv_len, :]

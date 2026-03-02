@@ -177,12 +177,20 @@ class QEffWanPipeline:
             ... )
         """
         # Load the base WAN model in float32 on CPU for optimization
-        model = cls._hf_auto_class.from_pretrained(
-            pretrained_model_name_or_path,
-            torch_dtype=torch.float32,
-            device_map="cpu",
-            **kwargs,
-        )
+        if torch.cuda.is_available():
+            model = cls._hf_auto_class.from_pretrained(
+                pretrained_model_name_or_path,
+                torch_dtype=torch.float16,
+                device_map="balanced",
+                **kwargs,
+            )
+        else:
+            model = cls._hf_auto_class.from_pretrained(
+                pretrained_model_name_or_path,
+                torch_dtype=torch.float32,
+                device_map="cpu",
+                **kwargs,
+            )
         return cls(
             model=model,
             pretrained_model_name_or_path=pretrained_model_name_or_path,
@@ -376,7 +384,7 @@ class QEffWanPipeline:
         output_type: str | None = "np",
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
-        callback_on_step_end: Callable[[int, int], None] | PipelineCallback | MultiPipelineCallbacks | None = None,
+        callback_on_step_end: Optional[Union[Callable[[int, int, Dict], None]]] = None,
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         max_sequence_length: int = 512,
     ):
@@ -450,11 +458,14 @@ class QEffWanPipeline:
                 indicating whether the corresponding generated image contains "not-safe-for-work" (nsfw) content.
         """
 
-        if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
-            callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
+        self._guidance_scale = guidance_scale
+        self._guidance_scale_2 = guidance_scale_2 if guidance_scale_2 is not None else guidance_scale
+        self._attention_kwargs = attention_kwargs
+        self._current_timestep = None
+        self._interrupt = False
 
         # 1. Check inputs. Raise error if not correct
-        self.check_inputs(
+        self.model.check_inputs(
             prompt,
             negative_prompt,
             height,
@@ -465,20 +476,20 @@ class QEffWanPipeline:
             guidance_scale_2,
         )
 
-        if num_frames % self.vae_scale_factor_temporal != 1:
+        if num_frames % self.model.vae.config.scale_factor_temporal != 1:
             logger.warning(
                 f"`num_frames - 1` has to be divisible by {self.vae_scale_factor_temporal}. Rounding to the nearest number."
             )
-            num_frames = num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
+            num_frames = num_frames // self.model.vae.config.scale_factor_temporal * self.model.vae.config.scale_factor_temporal + 1
         num_frames = max(num_frames, 1)
 
         patch_size = (
-            self.transformer.config.patch_size
-            if self.transformer is not None
-            else self.transformer_2.config.patch_size
+            self.model.transformer.config.patch_size
+            if self.model.transformer is not None
+            else self.model.transformer_2.config.patch_size
         )
-        h_multiple_of = self.vae_scale_factor_spatial * patch_size[1]
-        w_multiple_of = self.vae_scale_factor_spatial * patch_size[2]
+        h_multiple_of = self.model.vae_scale_factor_spatial * patch_size[1]
+        w_multiple_of = self.model.vae_scale_factor_spatial * patch_size[2]
         calc_height = height // h_multiple_of * h_multiple_of
         calc_width = width // w_multiple_of * w_multiple_of
         if height != calc_height or width != calc_width:
@@ -488,16 +499,19 @@ class QEffWanPipeline:
             )
             height, width = calc_height, calc_width
 
-        if self.config.boundary_ratio is not None and guidance_scale_2 is None:
+        if self.model.config.boundary_ratio is not None and guidance_scale_2 is None:
             guidance_scale_2 = guidance_scale
 
-        self._guidance_scale = guidance_scale
-        self._guidance_scale_2 = guidance_scale_2
-        self._attention_kwargs = attention_kwargs
-        self._current_timestep = None
-        self._interrupt = False
+        self.model._guidance_scale = guidance_scale
+        self.model._guidance_scale_2 = guidance_scale_2
+        self.model._attention_kwargs = attention_kwargs
+        self.model._current_timestep = None
+        self.model._interrupt = False
 
-        device = self._execution_device
+        # device = "cuda"
+        device = "cpu"
+
+        # import ipdb; ipdb.set_trace()
 
         # 2. Define call parameters
         if prompt is not None and isinstance(prompt, str):
@@ -508,10 +522,10 @@ class QEffWanPipeline:
             batch_size = prompt_embeds.shape[0]
 
         # 3. Encode input prompt
-        prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+        prompt_embeds, negative_prompt_embeds = self.model.encode_prompt(
             prompt=prompt,
             negative_prompt=negative_prompt,
-            do_classifier_free_guidance=self.do_classifier_free_guidance,
+            do_classifier_free_guidance=self.model.do_classifier_free_guidance,
             num_videos_per_prompt=num_videos_per_prompt,
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
@@ -519,22 +533,22 @@ class QEffWanPipeline:
             device=device,
         )
 
-        transformer_dtype = self.transformer.dtype if self.transformer is not None else self.transformer_2.dtype
+        transformer_dtype = self.model.transformer.dtype if self.model.transformer is not None else self.model.transformer_2.dtype
         prompt_embeds = prompt_embeds.to(transformer_dtype)
         if negative_prompt_embeds is not None:
             negative_prompt_embeds = negative_prompt_embeds.to(transformer_dtype)
 
         # 4. Prepare timesteps
-        self.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps = self.scheduler.timesteps
+        self.model.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.model.scheduler.timesteps
 
         # 5. Prepare latent variables
         num_channels_latents = (
-            self.transformer.config.in_channels
-            if self.transformer is not None
-            else self.transformer_2.config.in_channels
+            self.model.transformer.config.in_channels
+            if self.model.transformer is not None
+            else self.model.transformer_2.config.in_channels
         )
-        latents = self.prepare_latents(
+        latents = self.model.prepare_latents(
             batch_size * num_videos_per_prompt,
             num_channels_latents,
             height,
@@ -549,32 +563,34 @@ class QEffWanPipeline:
         mask = torch.ones(latents.shape, dtype=torch.float32, device=device)
 
         # 6. Denoising loop
-        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-        self._num_timesteps = len(timesteps)
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.model.scheduler.order
+        self.model._num_timesteps = len(timesteps)
 
-        if self.config.boundary_ratio is not None:
-            boundary_timestep = self.config.boundary_ratio * self.scheduler.config.num_train_timesteps
+        if self.model.config.boundary_ratio is not None:
+            boundary_timestep = self.model.config.boundary_ratio * self.model.scheduler.config.num_train_timesteps
         else:
             boundary_timestep = None
 
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
+        transformer_perf = []
+
+        with self.model.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                if self.interrupt:
+                if self.model.interrupt:
                     continue
 
-                self._current_timestep = t
+                self.model._current_timestep = t
 
                 if boundary_timestep is None or t >= boundary_timestep:
                     # wan2.1 or high-noise stage in wan2.2
-                    current_model = self.transformer
+                    current_model = self.transformer.model.transformer_high.to(device)
                     current_guidance_scale = guidance_scale
                 else:
                     # low-noise stage in wan2.2
-                    current_model = self.transformer_2
+                    current_model = self.transformer.model.transformer_low.to(device)
                     current_guidance_scale = guidance_scale_2
 
                 latent_model_input = latents.to(transformer_dtype)
-                if self.config.expand_timesteps:
+                if self.model.config.expand_timesteps:
                     # seq_len: num_latent_frames * latent_height//2 * latent_width//2
                     temp_ts = (mask[0][0][:, ::2, ::2] * t).flatten()
                     # batch_size, seq_len
@@ -582,28 +598,87 @@ class QEffWanPipeline:
                 else:
                     timestep = t.expand(latents.shape[0])
 
-                with current_model.cache_context("cond"):
-                    noise_pred = current_model(
+                # Extract dimensions for patch processing
+                batch_size, num_channels, num_frames, height, width = latents.shape
+                p_t, p_h, p_w = current_model.config.patch_size
+                post_patch_num_frames = num_frames // p_t
+                post_patch_height = height // p_h
+                post_patch_width = width // p_w
+
+                # Generate rotary position embeddings
+                rotary_emb = current_model.rope(latent_model_input)
+                rotary_emb = torch.cat(rotary_emb, dim=0)
+                ts_seq_len = None
+                timestep = timestep.flatten()
+
+                # Generate conditioning embeddings (time + text)
+                temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = (
+                    current_model.condition_embedder(
+                        timestep, prompt_embeds, encoder_hidden_states_image=None, timestep_seq_len=ts_seq_len
+                    )
+                )
+
+                # Generate negative conditioning for classifier-free guidance
+                if self.do_classifier_free_guidance:
+                    _, timestep_proj, encoder_hidden_states_neg, encoder_hidden_states_image = (
+                        current_model.condition_embedder(
+                            timestep,
+                            negative_prompt_embeds,
+                            encoder_hidden_states_image=None,
+                            timestep_seq_len=ts_seq_len,
+                        )
+                    )
+
+                timestep_proj = timestep_proj.unflatten(1, (6, -1))
+
+                start_transformer_step_time = time.perf_counter()
+                hidden_states = current_model(
+                    hidden_states=latent_model_input,
+                    temb=temb,
+                    timestep_proj=timestep_proj,
+                    rotary_emb=rotary_emb,
+                    encoder_hidden_states=encoder_hidden_states,
+                    attention_kwargs=attention_kwargs,
+                    return_dict=False,
+                )[0]
+                end_transformer_step_time = time.perf_counter()
+                transformer_perf.append(end_transformer_step_time - start_transformer_step_time)
+                print(f"DIT {i} time {end_transformer_step_time - start_transformer_step_time:.2f} seconds")
+                
+                hidden_states = hidden_states.reshape(
+                        batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
+                )
+
+                # Permute dimensions to reconstruct video tensor
+                hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
+                noise_pred = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+
+                if self.model.do_classifier_free_guidance:
+                    start_transformer_step_time = time.perf_counter()
+                    hidden_states = current_model(
                         hidden_states=latent_model_input,
-                        timestep=timestep,
-                        encoder_hidden_states=prompt_embeds,
+                        temb=temb,
+                        timestep_proj=timestep_proj,
+                        rotary_emb=rotary_emb,
+                        encoder_hidden_states=encoder_hidden_states_neg,
                         attention_kwargs=attention_kwargs,
                         return_dict=False,
                     )[0]
+                    end_transformer_step_time = time.perf_counter()
+                    transformer_perf.append(end_transformer_step_time - start_transformer_step_time)
 
-                if self.do_classifier_free_guidance:
-                    with current_model.cache_context("uncond"):
-                        noise_uncond = current_model(
-                            hidden_states=latent_model_input,
-                            timestep=timestep,
-                            encoder_hidden_states=negative_prompt_embeds,
-                            attention_kwargs=attention_kwargs,
-                            return_dict=False,
-                        )[0]
+                     # Reshape unconditional output
+                    hidden_states = hidden_states.reshape(
+                        batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1
+                    )
+
+                    hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
+                    noise_uncond = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+
                     noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
 
                 # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                latents = self.model.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -616,35 +691,39 @@ class QEffWanPipeline:
                     negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
 
                 # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.model.scheduler.order == 0):
                     progress_bar.update()
 
-                if XLA_AVAILABLE:
-                    xm.mark_step()
-
-        self._current_timestep = None
+        self.model._current_timestep = None
 
         if not output_type == "latent":
-            latents = latents.to(self.vae.dtype)
+            latents = latents.to(self.model.vae.dtype)
             latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, self.vae.config.z_dim, 1, 1, 1)
+                torch.tensor(self.model.vae.config.latents_mean)
+                .view(1, self.model.vae.config.z_dim, 1, 1, 1)
                 .to(latents.device, latents.dtype)
             )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+            latents_std = 1.0 / torch.tensor(self.model.vae.config.latents_std).view(1, self.model.vae.config.z_dim, 1, 1, 1).to(
                 latents.device, latents.dtype
             )
             latents = latents / latents_std + latents_mean
-            video = self.vae.decode(latents, return_dict=False)[0]
-            video = self.video_processor.postprocess_video(video, output_type=output_type)
+            start_decode_time = time.perf_counter()
+            video = self.vae_decoder.model.decode(latents, return_dict=False)[0]
+            end_decode_time = time.perf_counter()
+            vae_decoder_perf = end_decode_time - start_decode_time
+            video = self.model.video_processor.postprocess_video(video.detach(), output_type=output_type)
         else:
             video = latents
 
-        # Offload all models
-        self.maybe_free_model_hooks()
+        perf_data = {
+            "transformer": transformer_perf,  # Unified transformer (QAIC)
+            "vae_decoder": vae_decoder_perf,
+        }
+
+        perf_metrics = [ModulePerf(module_name=name, perf=perf_data[name]) for name in perf_data.keys()]
 
         return QEffPipelineOutput(
-            pipeline_module=[],
+            pipeline_module=perf_metrics,
             images=video,
         )
 
