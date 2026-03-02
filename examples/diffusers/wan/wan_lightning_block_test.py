@@ -53,10 +53,10 @@ os.environ["num_kv_blocks"] = "16"
 os.environ["num_q_blocks"] = "2"
 os.environ["skip_threshold"] = "100.0"
 
-block_configs = [[1, 8, 1, 0.1],
-                 [1, 4, 1, 0.1],
-                 [1, 8, 1, 0.001],
-                 [1, 4, 1, 0.001]]
+block_configs = [[1, 21, 2, 0.0001],
+                 [1, 21, 2, 0.1],
+                 [1, 21, 2, 0.01],
+                 [1, 21, 2, 0.001]]
                 #  [1, 24, 2, 0.5],
                 #  [1, 16, 1, 0.5],
                 #  [1, 24, 2, 10.0],
@@ -75,14 +75,14 @@ for config in block_configs:
 
     output = pipeline(
         prompt=prompt,
-        num_frames=29,
+        num_frames=81,
         guidance_scale=1.0,
         guidance_scale_2=1.0,
         num_inference_steps=4,
         generator=torch.manual_seed(0),
         custom_config_path="examples/diffusers/wan/wan_config.json",
-        height=256,
-        width=384,
+        height=480,
+        width=832,
         run_on_gpu=True,
     )
     frames = output.images[0]
