@@ -399,7 +399,8 @@ class QEffDynamicCache(DynamicCache):
             cache_kwargs (`Dict[str, Any]`, `optional`):
                 Additional arguments for the cache subclass. No additional arguments are used in `DynamicCache`.
         """
-        self.append_new_layers(layer_idx)
+        while len(self.layers) <= layer_idx:
+            self.layers.append(self.layer_class_to_replicate())
         return self.layers[layer_idx].write_only(key_states, value_states, cache_kwargs)
 
     # TODO:This function will be depercated in future.
@@ -426,7 +427,8 @@ class QEffDynamicCache(DynamicCache):
         Return:
             A tuple containing the updated key and value states.
         """
-        self.append_new_layers(layer_idx)
+        while len(self.layers) <= layer_idx:
+            self.layers.append(self.layer_class_to_replicate())
         return self.layers[layer_idx].update3D(key_states, value_states, cache_kwargs)
 
 

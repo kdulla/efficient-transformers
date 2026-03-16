@@ -31,6 +31,7 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     rotate_half,
 )
 
+from QEfficient.blocking.attention_blocking import AttentionBlockingConfig, generic_blocked_attention_interface
 from QEfficient.transformers.cache_utils import QEffDynamicCache
 from QEfficient.transformers.modeling_attn_mask_utils import _create_causal_mask
 from QEfficient.utils import constants
@@ -398,31 +399,25 @@ class QEffQwen3VLMoeTextAttention(Qwen3VLMoeTextAttention):
         query_states, key_states = qeff_apply_rotary_pos_emb(
             query_states, key_states, cos, sin, position_ids[1:], self.config.rope_scaling["mrope_section"]
         )
-        if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {
-                "sin": sin,
-                "cos": cos,
-                "batch_index": batch_index,
-                "position_ids": position_ids[0],
-            }
-            if comp_ctx_lengths is not None:
-                attention_mask = attention_mask[:, :, :, : comp_ctx_lengths.shape[-1]]
-                cache_kwargs["CCL"] = attention_mask.shape[-1]
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+                
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        blocking_config = getattr(self, "attn_blocking_config", AttentionBlockingConfig())
 
-        attention_interface: Callable = eager_attention_forward
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            cache_kwargs=cache_kwargs,
+        attn_output, attn_weights = generic_blocked_attention_interface(
+            module=self,
+            query=query_states,
+            key=key_states,
+            value=value_states,
+            attention_mask=attention_mask,
+            scaling=self.scaling,
             layer_idx=self.layer_idx,
-            past_key_values=past_key_values,
-            **kwargs,
+            past_key_value=past_key_values,
+            blocking_config=blocking_config,
+            comp_ctx_length=comp_ctx_lengths,
+            batch_index=batch_index,
+            position_ids=position_ids[0],
+            past_seen_tokens=past_seen_tokens,
+            non_blocked_forward=eager_attention_forward,
         )
 
         attn_output = attn_output.reshape(bsz, q_len, -1)
