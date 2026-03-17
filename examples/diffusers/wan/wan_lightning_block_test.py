@@ -10,12 +10,24 @@ import os
 from diffusers.loaders.lora_conversion_utils import _convert_non_diffusers_wan_lora_to_diffusers
 from diffusers.utils import export_to_video
 from huggingface_hub import hf_hub_download
-
 from QEfficient import QEffWanPipeline
 
 # Load the pipeline
-
 pipeline = QEffWanPipeline.from_pretrained("Wan-AI/Wan2.2-T2V-A14B-Diffusers")
+pipeline.transformer.model.transformer_high.config['num_layers'] = 2
+pipeline.transformer.model.transformer_low.config['num_layers']= 2
+
+# Reduce high noise transformer blocks
+original_blocks = pipeline.transformer.model.transformer_high.blocks
+pipeline.transformer.model.transformer_high.blocks = torch.nn.ModuleList(
+    [original_blocks[i] for i in range(0, pipeline.transformer.model.transformer_high.config.num_layers)]
+)
+
+# Reduce low noise transformer blocks
+org_blocks = pipeline.transformer.model.transformer_low.blocks
+pipeline.transformer.model.transformer_low.blocks = torch.nn.ModuleList(
+    [org_blocks[i] for i in range(0, pipeline.transformer.model.transformer_low.config.num_layers)]
+)
 
 # Download the LoRAs
 high_noise_lora_path = hf_hub_download(
@@ -75,14 +87,14 @@ for config in block_configs:
 
     output = pipeline(
         prompt=prompt,
-        num_frames=81,
+        num_frames=41,
         guidance_scale=1.0,
         guidance_scale_2=1.0,
         num_inference_steps=4,
         generator=torch.manual_seed(0),
         custom_config_path="examples/diffusers/wan/wan_config.json",
-        height=480,
-        width=832,
+        height=128,
+        width=208,
         run_on_gpu=True,
     )
     frames = output.images[0]

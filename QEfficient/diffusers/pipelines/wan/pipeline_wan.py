@@ -181,7 +181,7 @@ class QEffWanPipeline:
             model = cls._hf_auto_class.from_pretrained(
                 pretrained_model_name_or_path,
                 torch_dtype=torch.float16,
-                device_map="balanced",
+                device_map="cuda",
                 **kwargs,
             )
         else:
@@ -508,8 +508,10 @@ class QEffWanPipeline:
         self.model._current_timestep = None
         self.model._interrupt = False
 
-        # device = "cuda"
-        device = "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        else:
+            device = "cpu"
 
         # import ipdb; ipdb.set_trace()
 
