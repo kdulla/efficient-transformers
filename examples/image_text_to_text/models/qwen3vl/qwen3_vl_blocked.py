@@ -63,6 +63,26 @@ if skip_vision:
         use_onnx_subfunctions=False,
     )
 
+    qeff_model_blocked.transform(
+        ctx_len=4096, seq_len=128, batch_size=batch_size, num_devices=1, qaic_config=qaic_config
+    )
+    
+    qeff_model_blocked.compile(
+        batch_size=batch_size,
+        prefill_seq_len=128,
+        ctx_len=4096,
+        num_cores=16,
+        num_devices=4,
+        height=354,
+        width=536,
+        mxfp6_matmul=True,
+        aic_enable_depth_first=True,
+        skip_vision=True,
+        mos=1,
+        use_onnx_subfunctions=False,
+        qaic_config=qaic_config,
+    )
+
     messages = [
         {
             "role": "user",
@@ -74,19 +94,33 @@ if skip_vision:
 
     messages = [messages] * batch_size
 
-    inputs = processor.apply_chat_template(
+    inputs_processed = processor.apply_chat_template(
         messages,
         add_generation_prompt=True,
         tokenize=True,
         return_dict=True,
         return_tensors="pt",
     )
-    inputs = qeff_model.model.prepare_inputs_for_generation(inputs=inputs, prefill_seq_len=128, batch_size=batch_size)
+    inputs = qeff_model.model.prepare_inputs_for_generation(inputs=inputs_processed, prefill_seq_len=128, batch_size=batch_size)
     streamer = TextStreamer(tokenizer)
     output = qeff_model.generate(inputs=inputs, generation_len=100)
     print(output.generated_ids)
     print(processor.tokenizer.batch_decode(output.generated_ids))
     print(output)
+
+    inputs_processed = processor.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+    )
+    inputs_blocked = qeff_model.model.prepare_inputs_for_generation(inputs=inputs_processed, prefill_seq_len=128, batch_size=batch_size)
+    streamer = TextStreamer(tokenizer)
+    output_blocked = qeff_model_blocked.generate(inputs=inputs_blocked, generation_len=100)
+    print(output_blocked.generated_ids)
+    print(processor.tokenizer.batch_decode(output_blocked.generated_ids))
+    print(output_blocked)
 
 else:
     batch_size = 1
@@ -171,6 +205,7 @@ else:
         return_tensors="pt",
     )
     inputs = qeff_model.model.prepare_inputs_for_generation(inputs=inputs_processed, prefill_seq_len=128, batch_size=batch_size)
+    # import ipdb; ipdb.set_trace()
     streamer = TextStreamer(tokenizer)
     output = qeff_model.generate(inputs=inputs, generation_len=100)
     print(output.generated_ids)
