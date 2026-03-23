@@ -256,6 +256,7 @@ class QEFFBaseModel(ABC):
         tmp_onnx_path = tmp_onnx_dir / f"{self.model_name}.onnx"
         tmp_onnx_dir.mkdir(parents=True, exist_ok=True)
 
+
         # Create input_names from example_inputs
         input_names = []
         for param in inspect.signature(self.model.forward).parameters:
@@ -390,6 +391,8 @@ class QEFFBaseModel(ABC):
                 blocking_kwargs["num_q_blocks"] = blocking_config.num_q_blocks
             if blocking_config.head_block_size:
                 blocking_kwargs["head_block_size"] = blocking_config.head_block_size
+            if blocking_config.num_batch_blocks:
+                blocking_kwargs["num_batch_blocks"] = blocking_config.num_batch_blocks
 
     @dump_qconfig
     def _compile(

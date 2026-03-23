@@ -1319,6 +1319,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
                 kv_offload=True,
                 continuous_batching=self.continuous_batching,
                 comp_ctx_lengths=self.comp_ctx_lengths_decode,
+                **kwargs
             )
             dynamic_axes = self.model.get_onnx_dynamic_axes(
                 kv_offload=True,
@@ -1549,6 +1550,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
                 prefill_only=prefill_only,
                 enable_chunking=enable_chunking,
                 prefill_seq_len=prefill_seq_len,
+                full_batch_size=full_batch_size,
             )
 
         # TODO this hould be removed once the continous batching is supported for all the models.

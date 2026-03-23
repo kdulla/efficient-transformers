@@ -748,26 +748,30 @@ class QEffQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
         **kwargs,
     ):
         inputs_shapes = {}
-        inputs_shapes["input_ids"] = (constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE, constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN)
+        if continuous_batching:
+            export_batch_size = kwargs.get("full_batch_size", constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE)
+        else:
+            export_batch_size = constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE
+        inputs_shapes["input_ids"] = (export_batch_size, constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN)
         # vision_size = 1024
         vision_size = 187
         inputs_shapes["vision_embeds"] = (
-            constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE,
+            export_batch_size,
             vision_size,
             self.model.config.vision_config.out_hidden_size,
         )
         inputs_shapes["image_grid_thw"] = (1, 1, 22, 34)
         inputs_shapes["position_ids"] = (
             3,
-            constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE,
+            export_batch_size,
             constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN,
         )
         inputs_shapes["pixel_values"] = (748, 1536)
         inputs_shapes["image_idx"] = (1, 1)
-        inputs_shapes["image_sizes"] = (constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE, 2)
+        inputs_shapes["image_sizes"] = (export_batch_size, 2)
         inputs_shapes["deepstack_features"] = (
             len(self.config.vision_config.deepstack_visual_indexes),
-            constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE,
+            export_batch_size,
             vision_size,
             self.model.config.vision_config.out_hidden_size,
         )
@@ -782,7 +786,7 @@ class QEffQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
             (
                 torch.arange(constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN, dtype=torch.int64)
                 .view(1, constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN)
-                .repeat(constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE, 1)
+                .repeat(export_batch_size, 1)
             )
             .unsqueeze(0)
             .repeat(4, 1, 1)
@@ -791,8 +795,8 @@ class QEffQwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration):
         lang_inputs["deepstack_features"] = torch.zeros((inputs_shapes["deepstack_features"]), dtype=torch.float32)
         # Add data for KV
 
-        bs: int = constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE
-        fbs: int = constants.ONNX_EXPORT_EXAMPLE_FBS
+        bs: int = export_batch_size
+        fbs: int = export_batch_size
 
         kv_cache_shape = get_padding_shape_from_config(
             config=self.model.config.text_config,

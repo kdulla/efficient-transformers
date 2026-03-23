@@ -205,7 +205,6 @@ else:
         return_tensors="pt",
     )
     inputs = qeff_model.model.prepare_inputs_for_generation(inputs=inputs_processed, prefill_seq_len=128, batch_size=batch_size)
-    # import ipdb; ipdb.set_trace()
     streamer = TextStreamer(tokenizer)
     output = qeff_model.generate(inputs=inputs, generation_len=100)
     print(output.generated_ids)
