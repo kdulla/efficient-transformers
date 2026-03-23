@@ -91,7 +91,7 @@ def blocked_kv_attention_forward(
             kv_len_block = kv_block_positions[j + 1] - start_index
         end_index = start_index + kv_len_block
 
-        skip_future = (torch.tensor(start_index, device=query.device) > current_position).all()
+        # skip_future = (torch.tensor(start_index, device=query.device) > current_position).all()
 
         k_block, v_block = past_key_value.read_only_blockedKV(start_index, end_index, layer_idx, cache_kwargs)
         k_block_states, v_block_states = _get_kv_states(module, k_block, v_block)
@@ -141,15 +141,15 @@ def blocked_kv_attention_forward(
             delta_max.unsqueeze(-1)
         ) + torch.matmul(prob, v_block_states)
 
-        if torch.onnx.is_in_onnx_export() or torch.jit.is_tracing():
-            current_max = torch.where(skip_future, prev_max, current_max_updated)
-            current_denominator = torch.where(skip_future, prev_denominator, current_denominator_updated)
-            output = torch.where(skip_future.unsqueeze(-1), prev_output, output_updated)
-        else:
-            # Eager mode
-            current_max = current_max_updated
-            current_denominator = current_denominator_updated
-            output = output_updated
+        # if torch.onnx.is_in_onnx_export() or torch.jit.is_tracing():
+        #     current_max = torch.where(skip_future, prev_max, current_max_updated)
+        #     current_denominator = torch.where(skip_future, prev_denominator, current_denominator_updated)
+        #     output = torch.where(skip_future.unsqueeze(-1), prev_output, output_updated)
+        # else:
+        # Eager mode
+        current_max = current_max_updated
+        current_denominator = current_denominator_updated
+        output = output_updated
 
     attn_output = output.transpose(1, 2).contiguous()
     attn_weights = None
@@ -221,12 +221,12 @@ def blocked_qkv_attention_forward(
                 kv_len_block = kv_block_positions[j + 1] - start_index
             end_index = start_index + kv_len_block
 
-            skip_future = (torch.tensor(start_index, device=query.device) > current_position).all()
+            # skip_future = (torch.tensor(start_index, device=query.device) > current_position).all()
 
-            # Eager mode Only
-            if not torch.onnx.is_in_onnx_export() and not torch.jit.is_tracing():
-                if skip_future.item():
-                    break
+            # # Eager mode Only
+            # if not torch.onnx.is_in_onnx_export() and not torch.jit.is_tracing():
+            #     if skip_future.item():
+            #         break
 
             k_block, v_block = past_key_value.read_only_blockedKV(start_index, end_index, layer_idx, cache_kwargs)
             k_block_states, v_block_states = _get_kv_states(module, k_block, v_block)
@@ -282,15 +282,15 @@ def blocked_qkv_attention_forward(
                 delta_max.unsqueeze(-1)
             ) + torch.matmul(prob, v_block_states)
 
-            if torch.onnx.is_in_onnx_export() or torch.jit.is_tracing():
-                current_max = torch.where(skip_future, prev_max, current_max_updated)
-                current_denominator = torch.where(skip_future, prev_denominator, current_denominator_updated)
-                output_blocks = torch.where(skip_future.unsqueeze(-1), prev_output, output_updated)
-            else:
-                # Eager mode
-                current_max = current_max_updated
-                current_denominator = current_denominator_updated
-                output_blocks = output_updated
+            # if torch.onnx.is_in_onnx_export() or torch.jit.is_tracing():
+            #     current_max = torch.where(skip_future, prev_max, current_max_updated)
+            #     current_denominator = torch.where(skip_future, prev_denominator, current_denominator_updated)
+            #     output_blocks = torch.where(skip_future.unsqueeze(-1), prev_output, output_updated)
+            # else:
+            #     # Eager mode
+            current_max = current_max_updated
+            current_denominator = current_denominator_updated
+            output_blocks = output_updated
         q_output_blocks.append(output_blocks)
         q_attn_blocks.append(attn_weights_block)
 
