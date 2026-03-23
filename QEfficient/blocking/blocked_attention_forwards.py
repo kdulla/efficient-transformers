@@ -382,12 +382,12 @@ def blocked_hqkv_attention_forward(
                     kv_len_block = kv_block_positions[j + 1] - start_index
                 end_index = start_index + kv_len_block
 
-                skip_future = (torch.tensor(start_index, device=query.device) > current_position).all()
+                # skip_future = (torch.tensor(start_index, device=query.device) > current_position).all()
 
-                # Eager mode Only
-                if not torch.onnx.is_in_onnx_export() and not torch.jit.is_tracing():
-                    if skip_future.item():
-                        break
+                # # Eager mode Only
+                # if not torch.onnx.is_in_onnx_export() and not torch.jit.is_tracing():
+                #     if skip_future.item():
+                #         break
 
                 k_block, v_block = past_key_value.read_only_blockedKV(start_index, end_index, layer_idx, cache_kwargs)
                 k_block_states, v_block_states = _get_kv_states(module, k_block, v_block)
@@ -446,16 +446,16 @@ def blocked_hqkv_attention_forward(
                     (prev_denominator / current_denominator_updated).unsqueeze(-1)
                 ) * prev_output * torch.exp(delta_max.unsqueeze(-1)) + torch.matmul(prob, v_g)
 
-                if torch.onnx.is_in_onnx_export() or torch.jit.is_tracing():
-                    # skip_mask = skip_future.view(1, 1, 1).expand(batch_size, h_end - h_start, q_len_block)
-                    current_max = torch.where(skip_future, prev_max, current_max_updated)
-                    current_denominator = torch.where(skip_future, prev_denominator, current_denominator_updated)
-                    output_blocks = torch.where(skip_future, prev_output, output_updated)
-                else:
-                    # Eager mode
-                    current_max = current_max_updated
-                    current_denominator = current_denominator_updated
-                    output_blocks = output_updated
+                # if torch.onnx.is_in_onnx_export() or torch.jit.is_tracing():
+                #     # skip_mask = skip_future.view(1, 1, 1).expand(batch_size, h_end - h_start, q_len_block)
+                #     current_max = torch.where(skip_future, prev_max, current_max_updated)
+                #     current_denominator = torch.where(skip_future, prev_denominator, current_denominator_updated)
+                #     output_blocks = torch.where(skip_future, prev_output, output_updated)
+                # else:
+                # No Skips / Eager mode
+                current_max = current_max_updated
+                current_denominator = current_denominator_updated
+                output_blocks = output_updated
             q_output_blocks.append(output_blocks)
             q_attn_blocks.append(attn_weights_block)
 
