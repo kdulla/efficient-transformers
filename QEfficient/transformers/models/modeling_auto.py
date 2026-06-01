@@ -3072,7 +3072,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                     max_blocks = max(max_blocks, num_blocks)
             block_size = -(-seq_len // max_blocks)
             seq_len = block_size * max_blocks
-            seq_len = 192 # for head par export, figure out a better way than hardcoding this
+            seq_len = 32 # 192 * 2 # for head par export, should be num kv blocks * head_par_split
         fbs: int = constants.ONNX_EXPORT_EXAMPLE_FBS
 
         kv_cache_shape = get_padding_shape_from_config(
