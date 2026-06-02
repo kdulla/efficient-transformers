@@ -55,9 +55,9 @@ def main():
 
     if args.compare_non_blocking:
         if args.num_layers:
-            model = QEFFAutoModelForCausalLM.from_pretrained(args.model_name, num_hidden_layers=args.num_layers)
+            model = QEFFAutoModelForCausalLM.from_pretrained(args.model_name, num_hidden_layers=args.num_layers, enable_proxy=True)
         else:
-            model = QEFFAutoModelForCausalLM.from_pretrained(args.model_name)
+            model = QEFFAutoModelForCausalLM.from_pretrained(args.model_name, enable_proxy=True)
 
         # Compile the model
         qpc_path = model.compile(
@@ -81,9 +81,9 @@ def main():
     # setup qaic config to enable blocking, ensure 4 or more device ids are passed
     qaic_config = {"enable_blocking": True, "blocking_mode": args.blocking_mode, "kv_blocking_headpar_split": 16, "num_kv_blocks": 2}
     if args.num_layers:
-        model_blocked = QEFFAutoModelForCausalLM.from_pretrained(args.model_name, num_hidden_layers=args.num_layers)
+        model_blocked = QEFFAutoModelForCausalLM.from_pretrained(args.model_name, num_hidden_layers=args.num_layers, enable_proxy=True)
     else:
-        model_blocked = QEFFAutoModelForCausalLM.from_pretrained(args.model_name)
+        model_blocked = QEFFAutoModelForCausalLM.from_pretrained(args.model_name, enable_proxy=True)
 
     # model_blocked._offload_model_weights(True)
 
