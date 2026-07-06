@@ -20,7 +20,7 @@ subfunc_npi_file_path = os.path.join(dir_path, "subfunction_120b_npi.yaml")
 non_subfunc_npi_file_path = os.path.join(dir_path, "non_subfunction_120b_npi.yaml")
 
 # model_id = "tiny-random/gpt-oss-bf16"  # weights are not required to convert to fp32
-model_id = "openai/gpt-oss-20b"
+model_id = "openai/gpt-oss-120b"
 
 prompt = """
 Once upon a time, in a small town, there lived a young boy named Alex. Alex was a curious and adventurous child, always eager to explore the world around him. One day, while playing in the park, Alex stumbled upon a mysterious old book hidden beneath a pile of leaves. The book was filled with stories of distant lands, magical creatures, and extraordinary adventures.
