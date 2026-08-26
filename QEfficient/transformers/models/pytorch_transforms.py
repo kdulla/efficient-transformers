@@ -113,17 +113,13 @@ from transformers.models.granite.modeling_granite import (
 from transformers.models.granitemoe.modeling_granitemoe import (
     GraniteMoeAttention,
     GraniteMoeDecoderLayer,
+    GraniteMoeExperts,
     GraniteMoeForCausalLM,
     GraniteMoeModel,
     GraniteMoeMoE,
     GraniteMoeRMSNorm,
     GraniteMoeRotaryEmbedding,
-)
-from transformers.models.granitemoe.modeling_granitemoe import (
-    GraniteMoeExperts as GraniteMoeParallelExperts,
-)
-from transformers.models.granitemoe.modeling_granitemoe import (
-    GraniteMoeTopKRouter as GraniteMoeTopKGating,
+    GraniteMoeTopKRouter,
 )
 
 try:
@@ -473,12 +469,12 @@ from QEfficient.transformers.models.granite.modeling_granite import (
 from QEfficient.transformers.models.granitemoe.modeling_granitemoe import (
     QEffGraniteMoeAttention,
     QEffGraniteMoeDecoderLayer,
+    QEffGraniteMoeExperts,
     QEffGraniteMoeForCausalLM,
     QEffGraniteMoeModel,
     QEffGraniteMoeMoE,
-    QEffGraniteMoeParallelExperts,
     QEffGraniteMoeRotaryEmbedding,
-    QEffGraniteMoeTopKGating,
+    QEffGraniteMoeTopKRouter,
 )
 from QEfficient.transformers.models.grok_1.modeling_grok1 import (
     QEFFGrok1CustomRMSNormAIC,
@@ -1846,8 +1842,8 @@ class OptimizedMoEMapperTransform(ModuleMappingTransform):
         GptOssExperts: QEffGptOssExperts,
         # GraniteMoE
         GraniteMoeMoE: QEffGraniteMoeMoE,
-        GraniteMoeParallelExperts: QEffGraniteMoeParallelExperts,
-        GraniteMoeTopKGating: QEffGraniteMoeTopKGating,
+        GraniteMoeExperts: QEffGraniteMoeExperts,
+        GraniteMoeTopKRouter: QEffGraniteMoeTopKRouter,
         # Mixtral
         MixtralSparseMoeBlock: QEffMixtralSparseMoeBlock,
     }
