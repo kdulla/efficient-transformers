@@ -13,7 +13,7 @@ from transformers import AutoConfig, AutoProcessor, TextStreamer, AutoModelForIm
 
 from QEfficient import QEFFAutoModelForImageTextToText
 
-model_id = "Qwen/Qwen3.8-27B"
+model_id = "Qwen/Qwen3.8-2.4T-A95B"
 config = AutoConfig.from_pretrained(model_id)
 
 # For faster execution user can run with lesser layers, For Testing Purpose Only
@@ -46,7 +46,7 @@ qaic_config = {"blocking_mode": "kv", "num_kv_blocks": 2, "skip_kv": True}
 
 enable_blocking = False  # By default blocking is false
 ### use skip_vision=True, if want to run only text, or false ###
-skip_vision = False
+skip_vision = True
 
 BS = 1
 PREFILL_SEQ_LEN = 64
