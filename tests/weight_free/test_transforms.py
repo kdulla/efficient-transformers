@@ -1582,6 +1582,44 @@ class TestWeightFreeCheckpointTransforms:
         assert spec.inputs[0].name == "model.layers.0.mlp.moe_weights.gate"
         assert spec.inputs[0].location.key == "model.layers.0.mlp.moe_weights.gate"
 
+    def test_promotes_moe_alias_initializer(self, tmp_path, monkeypatch):
+        src = tmp_path / "src"
+        src.mkdir()
+        weight = torch.ones(2, 3, 4)
+        _write_safetensors_checkpoint(src, {"model.layers.0.mlp.moe_weights.gate": weight})
+
+        class MoEAliasModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = torch.nn.Module()
+                self.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+                self.model.layers[0].mlp = torch.nn.Module()
+                self.model.layers[0].mlp.experts = torch.nn.Module()
+                self.model.layers[0].mlp.experts.moe_weights = torch.nn.ParameterDict(
+                    {"gate": torch.nn.Parameter(weight)}
+                )
+
+        initializer = SimpleNamespace(shape=weight.shape, dtype=ir.DataType.FLOAT)
+        graph = SimpleNamespace(initializers={"model.layers.0.mlp.moe_weights.gate": initializer}, inputs=[])
+        onnx_program = SimpleNamespace(model=SimpleNamespace(graph=graph))
+        monkeypatch.setattr(
+            checkpoint_key_resolver.ir,
+            "Value",
+            lambda name, shape, type: SimpleNamespace(name=name, shape=shape, type=type),
+        )
+
+        spec = checkpoint_key_resolver.promote_initializers_and_build_spec(
+            onnx_program=onnx_program,
+            model_ref=str(src),
+            model_name="tiny-moe-alias",
+            qeff_model=SimpleNamespace(model=MoEAliasModel()),
+        )
+
+        assert "model.layers.0.mlp.moe_weights.gate" not in graph.initializers
+        assert [value.name for value in graph.inputs] == ["model.layers.0.mlp.moe_weights.gate"]
+        assert spec.inputs[0].name == "model.layers.0.mlp.moe_weights.gate"
+        assert spec.inputs[0].location.key == "model.layers.0.mlp.moe_weights.gate"
+
 
 def _fake_export(
     self,
