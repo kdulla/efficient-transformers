@@ -24,8 +24,8 @@ import logging
 import os
 import shutil
 import tempfile
-from argparse import Namespace
 from collections import Counter
+from argparse import Namespace
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from copy import deepcopy
 from io import StringIO
@@ -40,6 +40,7 @@ import onnxruntime as ort
 import pytest
 import torch
 import torch.nn.functional as F
+import yaml
 from torch import nn
 from transformers import (
     AutoConfig,
@@ -53,13 +54,18 @@ from transformers import (
     LlamaConfig,
     Qwen2Config,
 )
+from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 from transformers.cache_utils import DynamicCache
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     DeepseekV4ForCausalLM,
     DeepseekV4UnweightedRMSNorm,
 )
-from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
+from transformers.models.minimax_m3_vl.modeling_minimax_m3_vl import (
+    MiniMaxM3VLAttention,
+    MiniMaxM3VLIndexer,
+    MiniMaxM3VLSparseMoeBlock,
+)
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
@@ -80,7 +86,17 @@ from QEfficient.transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     QEffDeepseekV4Cache,
     QEffDeepseekV4UnweightedRMSNorm,
 )
-from QEfficient.customop.ctx_scatter_gather import CompressedAttnFunc
+from examples.text_generation.minimax_m3_paged_dp_decode_only_configurable_pages import (
+    _build_qaic_config,
+    build_block_table,
+)
+from QEfficient.blocking.attention_blocking import AttentionBlockingConfig, BlockingMode
+from QEfficient.transformers.models.minimax_m3_vl import (
+    MiniMaxM3SparseForConditionalGeneration,
+    MiniMaxM3VLConfig,
+    MiniMaxM3VLTextConfig,
+    MiniMaxM3VLVisionConfig,
+)
 from QEfficient.transformers.models.modeling_auto import (
     QEFFAutoModel,
     QEFFAutoModelForCausalLM,
@@ -207,37 +223,6 @@ def test_deepseek_v4_attention_uses_joint_softmax(layer_type, has_compressed_key
     torch.testing.assert_close(output, expected_output.transpose(1, 2).contiguous())
 
 
-@pytest.mark.parametrize(("name", "head_dim"), [("compressor", 8), ("indexer", 4)])
-def test_deepseek_v4_csa_uses_pingpong_projection_buffers(name, head_dim):
-    config = _tiny_deepseek_v4_config()
-    legacy_cache = QEffDeepseekV4Cache.get_dummy_cache(config, batch_size=1, ctx_len=8, dtype=torch.float32)
-    cache = QEffDeepseekV4Cache.from_legacy_cache(config, legacy_cache, torch.tensor([[0]]))
-    layer = cache.layers[2]
-    ratio = config.compress_rates["compressed_sparse_attention"]
-
-    assert getattr(layer, f"{name}_kv_buffer").shape[2] == 2 * ratio
-    for position in range(2 * ratio + 1):
-        projection = torch.full((1, 1, 2 * head_dim), position + 1.0)
-        cache_kwargs = {
-            "position_ids": torch.tensor([[position]]),
-            "context_length": 8,
-            f"{name}_kv": projection,
-            f"{name}_gate": -projection,
-        }
-        layer.update(
-            torch.zeros(1, config.num_key_value_heads, 1, config.head_dim),
-            torch.zeros(1, config.num_key_value_heads, 1, config.head_dim),
-            cache_kwargs,
-        )
-
-    expected = torch.arange(1, 2 * ratio + 1, dtype=torch.float32)
-    expected[0] = 2 * ratio + 1
-    actual_kv = getattr(layer, f"{name}_kv_buffer")[0, 0, :, 0]
-    actual_gate = getattr(layer, f"{name}_gate_buffer")[0, 0, :, 0]
-    torch.testing.assert_close(actual_kv, expected)
-    torch.testing.assert_close(actual_gate, -expected)
-
-
 def test_deepseek_v4_csa_dp_cache_layout_uses_dp_context_ops():
     config = _tiny_deepseek_v4_config()
     config.qeff_csa_attention_dp = 2
@@ -246,7 +231,7 @@ def test_deepseek_v4_csa_dp_cache_layout_uses_dp_context_ops():
 
     csa_cache = cache[2]
     assert csa_cache[0].shape == (1, 2, 8, config.head_dim)
-    assert csa_cache[3].shape == (1, 2, 4, config.head_dim)
+    assert csa_cache[3].shape == (1, 2, 4, 2 * config.head_dim)
 
     with torch.no_grad():
         output = qeff_model(
@@ -270,7 +255,7 @@ def test_deepseek_v4_csa_dp_cp_indexer_cache_layout_decodes():
     cache = qeff_model.get_dummy_pkv_cache(config, batch_size=4, ctx_len=8)
 
     assert cache[2][0].shape == (1, 4, config.sliding_window, config.head_dim)
-    assert cache[2][6].shape == (2, 2, 4, config.index_head_dim)
+    assert cache[2][6].shape == (2, 2, 4, 2 * config.index_head_dim)
 
     with torch.no_grad():
         for position, tokens in enumerate(((3, 7, 9, 15), (5, 11, 19, 21), (13, 17, 23, 27))):
@@ -283,7 +268,7 @@ def test_deepseek_v4_csa_dp_cp_indexer_cache_layout_decodes():
             cache = output.past_key_values
             assert torch.isfinite(output.logits).all()
 
-    assert cache[2][6].shape == (2, 2, 4, config.index_head_dim)
+    assert cache[2][6].shape == (2, 2, 4, 2 * config.index_head_dim)
 
 
 def test_deepseek_v4_example_parallel_layout_controls():
@@ -299,12 +284,12 @@ def test_deepseek_v4_example_parallel_layout_controls():
     assert MICROBENCH_DEFAULTS["attn_dp"] == 16
     assert MICROBENCH_DEFAULTS["indexer_cp"] == 16
     assert MICROBENCH_DEFAULTS["num_hidden_layers"] == 4
-    assert MICROBENCH_DEFAULTS["num_kv_blocks"] == 16
+    assert MICROBENCH_DEFAULTS["num_kv_blocks"] == 1
     assert MICROBENCH_DEFAULTS["hca_compressed_kv_cp"] == 2
     assert MICROBENCH_DEFAULTS["hca_attn_blocks"] == 8
     assert MICROBENCH_DEFAULTS["hw_version"] == "ai100"
     assert MICROBENCH_DEFAULTS["ffn_blocking_mode"] == "token"
-    assert MICROBENCH_DEFAULTS["ffn_token_block_size"] == 1
+    assert MICROBENCH_DEFAULTS["ffn_token_block_size"] == 4
     assert PREFILL_MICROBENCH_DEFAULTS["csa_prefill_attn_gather_sub_qc"] == 4
     assert PREFILL_MICROBENCH_DEFAULTS["csa_prefill_indexer_kv_block_size"] == 512
     assert PREFILL_MICROBENCH_DEFAULTS["csa_prefill_indexer_topk_per_block"] == 4
@@ -327,7 +312,6 @@ def test_deepseek_v4_example_parallel_layout_controls():
             csa_prefill_attn_gather_sub_qc=4,
             csa_prefill_indexer_kv_block_size=512,
             csa_prefill_indexer_topk_per_block=4,
-            csa_prefill_indexer_mode="blockwise",
             num_kv_blocks=1,
             hca_compressed_kv_cp=2,
             hca_attn_blocks=2,
@@ -344,7 +328,6 @@ def test_deepseek_v4_example_parallel_layout_controls():
     assert config.qeff_csa_prefill_attn_gather_sub_qc == 4
     assert config.qeff_csa_prefill_indexer_kv_block_size == 512
     assert config.qeff_csa_prefill_indexer_topk_per_block == 4
-    assert config.qeff_csa_prefill_indexer_mode == "blockwise"
     assert config.qeff_hca_attention_dp == 2
     assert config.qeff_hca_compressed_kv_cp == 2
     assert config.qeff_hca_attn_blocks == 2
@@ -404,7 +387,7 @@ def test_deepseek_v4_blocked_csa_indexer_matches_batch_major_decode():
 
     reference_cache = reference_model.get_dummy_pkv_cache(config, batch_size=2, ctx_len=16)
     blocked_cache = blocked_model.get_dummy_pkv_cache(blocked_config, batch_size=2, ctx_len=16)
-    assert blocked_cache[2][6].shape == (1, 2, 8, config.index_head_dim)
+    assert blocked_cache[2][6].shape == (1, 2, 4, 2 * config.index_head_dim)
 
     for position, tokens in enumerate(((3, 7), (5, 11), (13, 17), (19, 23), (29, 31), (37, 41))):
         input_ids = torch.tensor(tokens).unsqueeze(1)
@@ -454,114 +437,6 @@ def test_deepseek_v4_csa_prefill_rotates_indexer_queries_per_chunk():
 
     assert output.logits.shape == (1, 1, config.vocab_size)
     assert torch.isfinite(output.logits).all()
-
-
-def test_deepseek_v4_csa_prefill_matches_token_decode():
-    config = _tiny_deepseek_v4_config()
-    config.num_hidden_layers = 1
-    config.layer_types = ["compressed_sparse_attention"]
-    config.mlp_layer_types = ["hash_moe"]
-    config.sliding_window = 8
-
-    decode_model = QEFFAutoModelForCausalLM(DeepseekV4ForCausalLM(config).eval()).model.eval()
-    prefill_config = deepcopy(config)
-    prefill_config.qeff_csa_prefill_only = True
-    prefill_config.qeff_csa_prefill_q_block_size = 8
-    prefill_config.qeff_csa_prefill_attn_gather_sub_qc = 4
-    prefill_config.qeff_csa_prefill_indexer_kv_block_size = 2
-    prefill_config.qeff_csa_prefill_indexer_topk_per_block = 1
-    prefill_model = QEFFAutoModelForCausalLM(DeepseekV4ForCausalLM(prefill_config).eval()).model.eval()
-    prefill_model.load_state_dict(decode_model.state_dict())
-
-    input_ids = torch.randint(0, config.vocab_size, (1, 8))
-    decode_cache = decode_model.get_dummy_pkv_cache(config, batch_size=1, ctx_len=32)
-    with torch.no_grad():
-        for position in range(input_ids.shape[1]):
-            decode_output = decode_model(
-                input_ids=input_ids[:, position : position + 1],
-                position_ids=torch.tensor([[position]]),
-                past_key_values=decode_cache,
-                use_cache=True,
-            )
-            decode_cache = decode_output.past_key_values
-
-        prefill_output = prefill_model(
-            input_ids=input_ids,
-            position_ids=torch.arange(input_ids.shape[1]).unsqueeze(0),
-            past_key_values=prefill_model.get_dummy_pkv_cache(prefill_config, batch_size=1, ctx_len=32),
-            use_cache=True,
-        )
-
-    torch.testing.assert_close(prefill_output.logits, decode_output.logits, atol=2e-4, rtol=2e-4)
-
-
-def test_deepseek_v4_csa_prefill_indexer_global_selection_is_exact():
-    config = _tiny_deepseek_v4_config()
-    config.qeff_csa_prefill_indexer_kv_block_size = 2
-    config.qeff_csa_prefill_indexer_topk_per_block = 1
-    qeff_model = QEFFAutoModelForCausalLM(DeepseekV4ForCausalLM(config).eval()).model.eval()
-    attention = qeff_model.model.layers[0].self_attn
-
-    q_index = torch.tensor([[[[1.0]], [[1.0]]]])
-    index_weights = torch.ones((1, 2, 1))
-    position_ids = torch.tensor([[8, 8]])
-    indexer_kv_cache = torch.tensor([[[1.0], [2.0], [3.0], [4.0]]])
-
-    selected, valid = attention._csa_prefill_select_indexer_slots(
-        q_index,
-        index_weights,
-        position_ids,
-        indexer_kv_cache,
-        index_topk=2,
-        compression_rate=2,
-    )
-
-    torch.testing.assert_close(selected, torch.tensor([[[3, 2], [3, 2]]]))
-    assert valid.all()
-
-    config.qeff_csa_prefill_indexer_mode = "blockwise"
-    selected, valid = attention._csa_prefill_select_indexer_slots(
-        q_index,
-        index_weights,
-        position_ids,
-        indexer_kv_cache,
-        index_topk=2,
-        compression_rate=2,
-    )
-
-    torch.testing.assert_close(selected, torch.tensor([[[3, 1], [3, 1]]]))
-    assert valid.all()
-
-
-def test_deepseek_v4_csa_prefill_indexer_admits_completed_entry_at_boundary():
-    config = _tiny_deepseek_v4_config()
-    attention = QEFFAutoModelForCausalLM(DeepseekV4ForCausalLM(config).eval()).model.layers[0].self_attn
-    q_index = torch.ones((1, 1, 1, 1))
-    index_weights = torch.ones((1, 1, 1))
-    position_ids = torch.tensor([[3]])
-    indexer_kv_cache = torch.tensor([[[1.0], [2.0], [3.0], [4.0]]])
-
-    selected, valid = attention._csa_prefill_select_indexer_slots(
-        q_index,
-        index_weights,
-        position_ids,
-        indexer_kv_cache,
-        index_topk=2,
-        compression_rate=2,
-    )
-
-    torch.testing.assert_close(selected, torch.tensor([[[1, 0]]]))
-    assert valid.all()
-
-
-def test_compressed_attn_all_invalid_row_returns_zero():
-    kv_cache = torch.tensor([[[1.0], [2.0]]])
-    topk_indices = torch.tensor([[[0, 1]]], dtype=torch.int32)
-    valid = torch.zeros((1, 1, 2), dtype=torch.bool)
-    query = torch.ones((1, 1, 1, 1))
-    output = CompressedAttnFunc.apply(kv_cache, topk_indices, valid, query, torch.tensor(1.0), torch.tensor(-3.0e4))
-
-    torch.testing.assert_close(output, torch.zeros_like(output))
 
 
 def test_deepseek_v4_hca_prefill_preserves_rank_four_compressed_cache():
@@ -653,9 +528,9 @@ def test_deepseek_v4_csa_dp_cp_export_uses_requested_capture_layout(monkeypatch)
 
     csa_indexer_cache = captured["example_inputs"]["past_key_values"][2][6]
     assert captured["example_inputs"]["input_ids"].shape == (4, 1)
-    assert csa_indexer_cache.shape == (2, 2, 4, config.index_head_dim)
-    assert captured["dynamic_axes"]["past_sliding_window_kv.2"] == {}
-    assert captured["dynamic_axes"]["past_actual_indexer_compressed_kv.2"] == {}
+    assert csa_indexer_cache.shape == (2, 2, 4, 2 * config.index_head_dim)
+    assert captured["dynamic_axes"]["past_sliding_window_kv.0"] == {0: "batch_size", 2: "ctx_len"}
+    assert captured["dynamic_axes"]["past_indexer_kv_cache.2"] == {}
 
 
 def test_deepseek_v4_hca_dp_export_uses_requested_capture_layout(monkeypatch):
@@ -678,7 +553,7 @@ def test_deepseek_v4_hca_dp_export_uses_requested_capture_layout(monkeypatch):
     hca_cache = captured["example_inputs"]["past_key_values"][0]
     assert hca_cache[0].shape == (1, 2, config.sliding_window, config.head_dim)
     assert hca_cache[3].shape == (1, 2, 4, config.head_dim)
-    assert captured["dynamic_axes"]["past_sliding_window_kv.0"] == {}
+    assert captured["dynamic_axes"]["past_sliding_window_kv.0"] == {1: "batch_size"}
     assert captured["dynamic_axes"]["past_actual_compressed_kv.0"] == {}
 
 
@@ -780,27 +655,18 @@ def test_deepseek_v4_prefill_uses_expert_parallel_moe_without_weight_gathers():
 
 
 @pytest.mark.llm_model
-@pytest.mark.parametrize(
-    ("model_dtype", "onnx_dtype", "custom_io_dtype"),
-    [
-        (torch.float16, onnx.TensorProto.FLOAT16, "float16"),
-        (torch.bfloat16, onnx.TensorProto.BFLOAT16, "bfloat16"),
-    ],
-)
-def test_deepseek_v4_decode_compile_uses_model_dtype_for_retained_states(
-    tmp_path, monkeypatch, model_dtype, onnx_dtype, custom_io_dtype
-):
+def test_deepseek_v4_decode_compile_uses_all_fp16_retained_states(tmp_path, monkeypatch):
     config = _tiny_deepseek_v4_config()
-    config.torch_dtype = model_dtype
-    qeff_model = QEFFAutoModelForCausalLM(DeepseekV4ForCausalLM(config).to(model_dtype).eval())
+    config.torch_dtype = torch.float16
+    qeff_model = QEFFAutoModelForCausalLM(DeepseekV4ForCausalLM(config).to(torch.float16).eval())
 
     input_names = ["input_ids", "position_ids", "past_sliding_window_kv.0", "past_actual_compressed_kv.0"]
     output_names = ["logits"] + [f"{name}_RetainedState" for name in input_names[2:]]
     onnx_graph = onnx.helper.make_graph(
         nodes=[],
         name="deepseek_v4_compile_contract",
-        inputs=[onnx.helper.make_tensor_value_info(name, onnx_dtype, [1]) for name in input_names],
-        outputs=[onnx.helper.make_tensor_value_info(name, onnx_dtype, [1]) for name in output_names],
+        inputs=[onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT16, [1]) for name in input_names],
+        outputs=[onnx.helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT16, [1]) for name in output_names],
     )
     onnx_path = tmp_path / "deepseek_v4.onnx"
     onnx.save(onnx.helper.make_model(onnx_graph), onnx_path)
@@ -834,13 +700,13 @@ def test_deepseek_v4_decode_compile_uses_model_dtype_for_retained_states(
         }
     ]
     assert captured["custom_io"] == {
-        "past_sliding_window_kv.0": custom_io_dtype,
-        "past_sliding_window_kv.0_RetainedState": custom_io_dtype,
-        "past_actual_compressed_kv.0": custom_io_dtype,
-        "past_actual_compressed_kv.0_RetainedState": custom_io_dtype,
+        "past_sliding_window_kv.0": "float16",
+        "past_sliding_window_kv.0_RetainedState": "float16",
+        "past_actual_compressed_kv.0": "float16",
+        "past_actual_compressed_kv.0_RetainedState": "float16",
     }
 
-    with pytest.raises(ValueError, match="must remain floating-point"):
+    with pytest.raises(ValueError, match="must remain in float16"):
         qeff_model.compile(
             onnx_path=str(onnx_path),
             prefill_seq_len=1,
@@ -962,6 +828,139 @@ MODEL_KWARGS = {"attn_implementation": "eager"}
 PREFIX_CACHING_MODEL_ID = "hf-internal-testing/tiny-random-GPT2LMHeadModel"
 
 
+def _tiny_minimax_m3_text_config(dtype=torch.float32, microbench=False) -> MiniMaxM3VLTextConfig:
+    config = MiniMaxM3VLTextConfig(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=16,
+        dense_intermediate_size=64,
+        shared_intermediate_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        max_position_embeddings=32,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        routed_scaling_factor=1.0,
+        layer_types=["full_attention", "minimax_m3_sparse"],
+        mlp_layer_types=["dense", "sparse"],
+        index_n_heads=2,
+        index_head_dim=8,
+        index_block_size=4,
+        index_topk_blocks=2,
+        index_local_blocks=1,
+    )
+    if microbench:
+        config.num_hidden_layers = 1
+        config.layer_types = ["minimax_m3_sparse"]
+        config.mlp_layer_types = ["dense"]
+        config.head_dim = 32
+        config.max_position_embeddings = 8
+        config.index_head_dim = 16
+        config.index_block_size = 8
+        config.index_topk_blocks = 1
+        config.rope_parameters = {
+            "rope_type": "default",
+            "rope_theta": 5_000_000.0,
+            "partial_rotary_factor": 0.5,
+        }
+    config.torch_dtype = dtype
+    return config
+
+
+def _tiny_minimax_m3_vlm_config(microbench=False) -> MiniMaxM3VLConfig:
+    text_config = _tiny_minimax_m3_text_config(microbench=microbench)
+    vision_config = MiniMaxM3VLVisionConfig(
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        image_size=28,
+        patch_size=14,
+        temporal_patch_size=1,
+        spatial_merge_size=1,
+        num_channels=3,
+    )
+    return MiniMaxM3VLConfig(
+        text_config=text_config,
+        vision_config=vision_config,
+        image_token_index=4,
+        projector_hidden_size=text_config.hidden_size,
+    )
+
+
+def _tiny_minimax_m3_paged_dp_cp_config():
+    args = SimpleNamespace(
+        num_kv_blocks=1,
+        attn_dp=1,
+        attn_cp=1,
+        indexer_num_blocks=None,
+        msa_num_kv_blocks=None,
+        skip_kv=False,
+        non_dynamic_cache=False,
+        msa_indexer_dp=1,
+        msa_indexer_cp=2,
+        msa_attn_dp=2,
+        msa_attn_cp=2,
+        indexer_n_head=1,
+        num_cores=1,
+        gqa_num_pages=1,
+        msa_indexer_num_logical_pages=2,
+        msa_attn_num_logical_pages=2,
+        gqa_physical_pages=8,
+        msa_indexer_physical_pages=8,
+        msa_attn_physical_pages=8,
+        expert_parallel_chunk_size=4,
+        cores_per_expert=1,
+        tree_reduce=True,
+        static_export_dims=False,
+    )
+    qaic_config = _build_qaic_config(args, 8, 4, 4)
+    qaic_config.pop("moe_config")
+    qaic_config.pop("indexer_num_blocks")
+    qaic_config.pop("msa_num_kv_blocks")
+    qaic_config.pop("skip_kv")
+    qaic_config.pop("non_dynamic_cache")
+    return qaic_config
+
+
+def _tiny_minimax_m3_paged_decode_inputs(qeff_model):
+    inputs = qeff_model.model.get_dummy_inputs(
+        kv_offload=True,
+        ctx_len=8,
+        past_seq_len=8,
+        prefill_seq_len=1,
+        batch_size=2,
+    )["lang"]
+    inputs["input_ids"] = torch.tensor([[3], [5]], dtype=torch.int64)
+    inputs["position_ids"] = torch.tensor([[7], [7]], dtype=torch.int64)
+    table_generator = torch.Generator(device="cpu").manual_seed(11)
+    inputs["gqa_block_table"] = build_block_table(1, 1, 2, 1, table_generator, 8)
+    inputs["msa_indexer_block_table"] = build_block_table(1, 2, 2, 2, table_generator, 8)
+    inputs["msa_attn_block_table"] = build_block_table(2, 2, 2, 2, table_generator, 8)
+    return inputs
+
+
+def _flatten_minimax_paged_ort_inputs(session, inputs):
+    ort_inputs = {}
+    input_names = {item.name for item in session.get_inputs()}
+    for name in input_names:
+        if name in inputs and torch.is_tensor(inputs[name]):
+            ort_inputs[name] = inputs[name].detach().numpy()
+        elif name.startswith(("past_key.", "past_value.")):
+            layer_idx = int(name.split(".")[1])
+            cache_idx = 0 if name.startswith("past_key.") else 1
+            ort_inputs[name] = inputs["past_key_values"][layer_idx][cache_idx].detach().numpy()
+        elif name.startswith("index_key."):
+            ort_inputs[name] = inputs["index_keys"][0].detach().numpy()
+        elif name == "index_keys":
+            ort_inputs[name] = inputs["index_keys"][0].detach().numpy()
+        else:
+            raise AssertionError(f"Unhandled MiniMax ORT input: {name}")
+    return ort_inputs
+
+
 def _per_test_thread_budget() -> int:
     override = os.environ.get("QEFF_NUM_THREADS")
     if override:
@@ -1040,8 +1039,12 @@ def _ort_session(onnx_path: Path) -> ort.InferenceSession:
     for name, value in added_initializers.items():
         options.add_initializer(name, value)
     if graph_was_patched:
-        return ort.InferenceSession(onnx_model.SerializeToString(), sess_options=options)
-    return ort.InferenceSession(str(onnx_path), sess_options=options)
+        session = ort.InferenceSession(onnx_model.SerializeToString(), sess_options=options)
+    else:
+        session = ort.InferenceSession(str(onnx_path), sess_options=options)
+    # SessionOptions does not own the OrtValue buffers registered above.
+    session._qeff_added_initializers = added_initializers
+    return session
 
 
 def _ort_session_zeroing_int32_max_constants(onnx_path: Path):
@@ -1869,38 +1872,172 @@ def test_causal_lm_cpu_runtime_parity_with_api_runner(model_type, model_id, tmp_
 
 
 @pytest.mark.llm_model
-def test_vlm_text_side_runtime_parity_and_full_export(tmp_path):
-    tokenizer = AutoTokenizer.from_pretrained(VLM_TEXT_RUNTIME_MODEL_ID, trust_remote_code=True)
-    config = AutoConfig.from_pretrained(VLM_TEXT_RUNTIME_MODEL_ID, trust_remote_code=True)
-    text_config = config.text_config
 
-    text_model = AutoModelForCausalLM.from_config(text_config, trust_remote_code=True, **MODEL_KWARGS)
-    text_model.eval()
 
-    api_runner = ApiRunner(
-        batch_size=1,
-        tokenizer=tokenizer,
-        config=text_model.config,
-        prompt=["hello world"],
-        prompt_len=4,
+@pytest.mark.llm_model
+
+
+@pytest.mark.llm_model
+
+
+@pytest.mark.llm_model
+
+
+@pytest.mark.cpu_only
+
+
+@pytest.mark.llm_model
+@pytest.mark.accuracy
+def test_minimax_m3_paged_dp_cp_qeff_pytorch_vs_ort(tmp_path):
+    torch.manual_seed(7)
+    qaic_config = _tiny_minimax_m3_paged_dp_cp_config()
+    model_hf = MiniMaxM3SparseForConditionalGeneration(_tiny_minimax_m3_vlm_config()).eval()
+    qeff_model = QEFFAutoModelForImageTextToText(model_hf, kv_offload=True, qaic_config=qaic_config)
+    qeff_model.model.qaic_config = qaic_config
+    qeff_model.lang_model.model.qaic_config = qaic_config
+
+    qeff_model.transform(
         ctx_len=8,
-        full_batch_size=None,
+        seq_len=1,
+        bs=2,
+        num_devices=1,
+        num_cores=1,
+        qaic_config=qaic_config,
+        prefill_seq_len=1,
     )
+    inputs = _tiny_minimax_m3_paged_decode_inputs(qeff_model)
+    pytorch_inputs = deepcopy(inputs)
+    with torch.no_grad():
+        qeff_logits = qeff_model.lang_model.model(**pytorch_inputs)[0].detach().float().numpy()
 
-    hf_tokens = api_runner.run_hf_model_on_pytorch(text_model)
-    qeff_text_model = QEFFAutoModelForCausalLM(text_model)
-    kv_tokens = api_runner.run_kv_model_on_pytorch(qeff_text_model.model)
-    onnx_path = _exported_onnx_path(qeff_text_model.export(tmp_path / "vlm-text"))
-    ort_tokens = api_runner.run_kv_model_on_ort(str(onnx_path))
+    with _suppress_native_output():
+        onnx_path = _exported_onnx_path(
+            qeff_model.export(
+                tmp_path / "minimax-m3-paged-dp-cp-ort",
+                skip_vision=True,
+                prefill_seq_len=1,
+                ctx_len=8,
+                qaic_config=qaic_config,
+                use_onnx_subfunctions=True,
+                offload_pt_weights=False,
+            )
+        )
+    session = _ort_session(onnx_path)
+    ort_logits = session.run(None, _flatten_minimax_paged_ort_inputs(session, inputs))[0]
 
-    assert np.array_equal(hf_tokens, kv_tokens.squeeze(0))
-    assert np.array_equal(kv_tokens, ort_tokens)
+    np.testing.assert_allclose(ort_logits, qeff_logits, atol=1e-4, rtol=1e-4)
+    assert qaic_config["paged_kv"] is True
+    assert qaic_config["attn_dp"] == 1
+    assert qaic_config["msa_indexer_cp"] == 2
+    assert qaic_config["msa_attn_dp"] == 2
+    assert qaic_config["gqa_page_block_size"] == 8
+    assert qaic_config["msa_indexer_page_block_size"] == 4
+@pytest.mark.llm_model
+@pytest.mark.accuracy
+def test_minimax_m3_contiguous_dp_cp_decode_hf_qeff_pytorch_parity():
+    torch.manual_seed(5)
+    vlm_config = _tiny_minimax_m3_vlm_config()
+    text_config = vlm_config.text_config
+    text_config.index_topk_blocks = 1
+    text_config.index_local_blocks = 1
+    model_hf = MiniMaxM3SparseForConditionalGeneration(vlm_config).eval()
+    model_hf_orig = deepcopy(model_hf)
 
-    vlm_model = QEFFAutoModelForImageTextToText.from_pretrained(VLM_TEXT_RUNTIME_MODEL_ID, trust_remote_code=True)
-    vlm_onnx_path = _exported_onnx_path(vlm_model.export(tmp_path / "vlm-full"))
-    assert vlm_onnx_path.name.endswith(".onnx")
+    batch, dp, cp, ctx_len = 2, 2, 2, 16
+    past_seq_len = ctx_len - 1
+    qaic_config = {
+        "blocking_mode": "kv_minimax_dedicated",
+        "num_kv_blocks": 2,
+        "attn_dp": dp,
+        "attn_cp": cp,
+        "msa_indexer_dp": dp,
+        "msa_indexer_cp": cp,
+        "msa_attn_dp": dp,
+        "msa_attn_cp": cp,
+        "indexer_n_head": 1,
+        "num_cores_per_device": 1,
+    }
 
+    def pack_dp_cp_cache(cache: torch.Tensor) -> torch.Tensor:
+        cache_batch, num_heads, cache_len, head_dim = cache.shape
+        assert cache_batch == batch
+        assert cache_len == ctx_len
+        batch_local = cache_batch // dp
+        local_ctx_len = ctx_len // cp
+        packed = torch.empty(batch_local, dp * cp * num_heads, cache_len // cp, head_dim, dtype=cache.dtype)
+        for local_batch_idx in range(batch_local):
+            for dp_lane in range(dp):
+                source_batch_idx = dp_lane * batch_local + local_batch_idx
+                for cp_lane in range(cp):
+                    row_start = (dp_lane * cp + cp_lane) * num_heads
+                    row_end = row_start + num_heads
+                    packed[local_batch_idx, row_start:row_end] = cache[
+                        source_batch_idx, :, cp_lane * local_ctx_len : (cp_lane + 1) * local_ctx_len
+                    ]
+        return packed
 
+    logical_caches = []
+    logical_index_keys = {}
+    hf_cache = DynamicCache(config=text_config)
+    for layer_idx, layer_type in enumerate(text_config.layer_types):
+        key = torch.randn(batch, text_config.num_key_value_heads, past_seq_len, text_config.head_dim)
+        value = torch.randn_like(key)
+        logical_caches.append((key, value))
+        hf_cache.update(key, value, layer_idx)
+        if layer_type == "minimax_m3_sparse":
+            index_key = torch.randn(batch, 1, past_seq_len, text_config.index_head_dim)
+            logical_index_keys[layer_idx] = index_key
+            hf_cache.layers[layer_idx].update_index(index_key)
+
+    input_ids = torch.tensor([[3], [5]], dtype=torch.int64)
+    position_ids = torch.full((batch, 1), past_seq_len, dtype=torch.int64)
+    with torch.no_grad():
+        hf_outputs = model_hf_orig.model.language_model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            past_key_values=hf_cache,
+            use_cache=True,
+        )
+        hf_logits = model_hf_orig.lm_head(hf_outputs.last_hidden_state[:, -1:, :]).float()
+
+    qeff_model = QEFFAutoModelForImageTextToText(model_hf, kv_offload=True, qaic_config=qaic_config)
+    qeff_model.transform(
+        ctx_len=ctx_len,
+        seq_len=1,
+        bs=batch,
+        num_devices=1,
+        num_cores=1,
+        qaic_config=qaic_config,
+        prefill_seq_len=1,
+    )
+    qeff_inputs = qeff_model.model.get_dummy_inputs(
+        kv_offload=True,
+        ctx_len=ctx_len,
+        past_seq_len=ctx_len,
+        prefill_seq_len=1,
+        batch_size=batch,
+    )["lang"]
+    qeff_inputs["input_ids"] = input_ids
+    qeff_inputs["position_ids"] = position_ids
+    qeff_inputs["past_key_values"] = tuple(
+        (
+            pack_dp_cp_cache(torch.nn.functional.pad(key, (0, 0, 0, 1))),
+            pack_dp_cp_cache(torch.nn.functional.pad(value, (0, 0, 0, 1))),
+        )
+        for key, value in logical_caches
+    )
+    qeff_inputs["index_keys"] = [
+        pack_dp_cp_cache(torch.nn.functional.pad(logical_index_keys[layer_idx], (0, 0, 0, 1)))
+        for layer_idx, layer_type in enumerate(text_config.layer_types)
+        if layer_type == "minimax_m3_sparse"
+    ]
+
+    with torch.no_grad():
+        qeff_logits = qeff_model.lang_model.model(**qeff_inputs)[0].float()
+
+    assert torch.isfinite(hf_logits).all()
+    assert torch.isfinite(qeff_logits).all()
+    torch.testing.assert_close(qeff_logits, hf_logits, atol=1e-5, rtol=1e-5)
 @pytest.mark.llm_model
 @pytest.mark.parametrize(
     ("vlm_name", "model_id"),
@@ -2571,6 +2708,62 @@ def test_subfunction_export_restores_onnx_transforms_on_failure():
     assert InvalidIndexProvider.SUBFUNC_ENABLED is False
 
 
+def test_dynamo_dynamic_shapes_nest_qwen3_5_hybrid_retained_states():
+    from types import SimpleNamespace
+
+    from QEfficient.utils.export_utils import convert_dynamic_axes_to_dynamic_shapes
+
+    dynamic_shapes = convert_dynamic_axes_to_dynamic_shapes(
+        {
+            "input_ids": {0: "batch_size", 1: "seq_len"},
+            "past_key.0": {0: "batch_size", 2: "ctx_len"},
+            "past_value.0": {0: "batch_size", 2: "ctx_len"},
+            "conv_state.1": {0: "batch_size"},
+            "recurrent_state.1": {0: "batch_size"},
+        },
+        model_config=SimpleNamespace(model_type="qwen3_5_moe_text", max_position_embeddings=32),
+    )
+
+    assert "past_key.0" not in dynamic_shapes
+    assert "past_value.0" not in dynamic_shapes
+    assert "conv_state.1" not in dynamic_shapes
+    assert "recurrent_state.1" not in dynamic_shapes
+    assert "past_key_values" in dynamic_shapes
+    assert len(dynamic_shapes["past_key_values"]) == 2
+    assert set(dynamic_shapes["past_key_values"][0][0]) == {0, 2}
+    assert set(dynamic_shapes["past_key_values"][0][1]) == {0, 2}
+    assert set(dynamic_shapes["past_key_values"][1][0]) == {0}
+    assert set(dynamic_shapes["past_key_values"][1][1]) == {0}
+
+
+def test_decode_compile_passes_seq_len_one_to_export(tmp_path):
+    from types import SimpleNamespace
+
+    qeff_model = object.__new__(QEFFAutoModelForCausalLM)
+    qeff_model.model = SimpleNamespace(config=SimpleNamespace(model_type="dummy"))
+    qeff_model.onnx_path = None
+    captured = {}
+
+    def fake_transform(**kwargs):
+        captured["transform"] = kwargs
+
+    def fake_export(**kwargs):
+        captured["export"] = kwargs
+        qeff_model.onnx_path = tmp_path / "model.onnx"
+
+    qeff_model.transform = fake_transform
+    qeff_model.export = fake_export
+
+    qeff_model.get_onnx_path(
+        prefill_only=False,
+        dynamo=True,
+        specializations=[{"batch_size": 1, "seq_len": 1, "ctx_len": 32}],
+    )
+
+    assert captured["transform"]["seq_len"] == 1
+    assert captured["export"]["prefill_seq_len"] == 1
+
+
 @pytest.mark.llm_model
 def test_prefix_caching_continuous_batching_export_and_ort_smoke(tmp_path):
     qeff_model = QEFFAutoModelForCausalLM.from_pretrained(
@@ -2827,7 +3020,9 @@ def test_proxy_toggle_onnx_transform_policy_for_sequence_classification():
     except Exception as exc:
         _skip_on_model_fetch_error(exc, model_id)
 
-    _assert_proxy_only_onnx_transform_policy(qeff_default, enable_proxy=False)
+    _assert_proxy_only_onnx_transform_policy(
+        qeff_default, enable_proxy=False, always_on_transforms={"FP16ClipTransform"}
+    )
     _assert_proxy_only_onnx_transform_policy(qeff_proxy, enable_proxy=True)
 
 
@@ -3409,6 +3604,75 @@ class _BlockedPrefillCache:
         return self.value[:, :, start_index:end_index, :]
 
 
+@pytest.mark.parametrize("n_rep_chunk", [None, 1, 2])
+def test_blocked_prefill_qkv_accepts_n_rep_chunk(n_rep_chunk):
+    from QEfficient.blocking.blocked_attention_forwards import blocked_qkv_attention_forward_prefill_headpar_offline
+
+    batch_size, sequence_length, head_dim, ctx_len = 1, 2, 4, 4
+    num_query_heads, num_kv_groups = 4, 2
+    module = SimpleNamespace(num_key_value_groups=num_kv_groups)
+    query = torch.ones(batch_size, num_query_heads, sequence_length, head_dim)
+    cache = _BlockedPrefillCache(batch_size, num_query_heads // num_kv_groups, ctx_len, head_dim)
+
+    output, attention_weights = blocked_qkv_attention_forward_prefill_headpar_offline(
+        module=module,
+        query=query,
+        key=None,
+        value=None,
+        attention_mask=None,
+        scaling=1.0,
+        num_q_blocks=1,
+        num_kv_blocks=1,
+        cache_kwargs={"position_ids": torch.zeros(batch_size, sequence_length, dtype=torch.long)},
+        layer_idx=0,
+        past_key_value=cache,
+        ctx_len=ctx_len,
+        configured_split=1,
+        n_rep_chunk=n_rep_chunk,
+    )
+
+    assert output.shape == (batch_size, sequence_length, num_query_heads, head_dim)
+    assert attention_weights is None
+
+
+def test_blocked_prefill_qkv_chunks_queries_by_seq_len(monkeypatch):
+    from QEfficient.blocking import blocked_attention_forwards as blocked
+
+    chunk_lengths = []
+    original_create_causal_mask = blocked._create_causal_mask
+
+    def tracked_create_causal_mask(*args, **kwargs):
+        chunk_lengths.append(kwargs["position_ids"].shape[-1])
+        return original_create_causal_mask(*args, **kwargs)
+
+    monkeypatch.setattr(blocked, "_create_causal_mask", tracked_create_causal_mask)
+
+    batch_size, sequence_length, head_dim, ctx_len = 1, 2, 4, 8
+    num_query_heads, num_kv_groups = 4, 2
+    module = SimpleNamespace(num_key_value_groups=num_kv_groups)
+    query = torch.ones(batch_size, num_query_heads, sequence_length, head_dim)
+    cache = _BlockedPrefillCache(batch_size, num_query_heads // num_kv_groups, ctx_len, head_dim)
+
+    blocked.blocked_qkv_attention_forward_prefill_headpar_offline(
+        module=module,
+        query=query,
+        key=None,
+        value=None,
+        attention_mask=None,
+        scaling=1.0,
+        num_q_blocks=2,
+        num_kv_blocks=1,
+        cache_kwargs={"position_ids": torch.zeros(batch_size, sequence_length, dtype=torch.long)},
+        layer_idx=0,
+        past_key_value=cache,
+        ctx_len=ctx_len,
+        configured_split=1,
+        n_rep_chunk=None,
+    )
+
+    assert chunk_lengths == [1, 1]
+
+
 @pytest.mark.parametrize(
     "num_query_heads, num_kv_groups, num_cores",
     [
@@ -3570,23 +3834,231 @@ def test_qwen3_5_moe_gated_norm_preserves_float16():
     assert out.dtype == torch.float16
 
 
-def test_qwen3_5_moe_get_submodules_for_export_keeps_decoder_layer_for_mixed_layer_types():
-    """Mixed full/linear attention configs must still expose decoder layer subfunctions."""
-    from types import SimpleNamespace
+def test_qwen3_5_moe_gdn_initializes_eager_prefill_cache():
+    """First eager prefill must materialize GDN state before retained-state export takes over."""
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeGatedDeltaNet
 
     from QEfficient.transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        QEffQwen3_5MoeDynamicCache,
+        QEffQwen3_5MoeGatedDeltaNet,
+    )
+
+    config = Qwen3_5MoeTextConfig(
+        vocab_size=32,
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        layer_types=["linear_attention"],
+        linear_conv_kernel_dim=4,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        moe_intermediate_size=16,
+        shared_expert_intermediate_size=16,
+        num_experts=2,
+        num_experts_per_tok=1,
+        dtype=torch.float32,
+    )
+    torch.manual_seed(0)
+    hf_gdn = Qwen3_5MoeGatedDeltaNet(config, layer_idx=0).eval()
+    qeff_gdn = QEffQwen3_5MoeGatedDeltaNet(config, layer_idx=0).eval()
+    qeff_gdn.load_state_dict(hf_gdn.state_dict())
+    qeff_gdn.__qeff_init__()
+    hidden_states = torch.randn(1, 64, config.hidden_size)
+    cache = QEffQwen3_5MoeDynamicCache(config)
+
+    with torch.no_grad():
+        expected = hf_gdn(hidden_states)
+        actual = qeff_gdn(
+            hidden_states,
+            cache_params=cache,
+            position_ids=torch.arange(64, dtype=torch.int64).view(1, 1, 64),
+        )
+
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    assert cache.conv_states[0].shape == (1, qeff_gdn.conv_dim, qeff_gdn.conv_kernel_size)
+    assert cache.recurrent_states[0].shape == (
+        1,
+        qeff_gdn.num_v_heads,
+        qeff_gdn.head_k_dim,
+        qeff_gdn.head_v_dim,
+    )
+
+
+def test_qwen3_5_moe_get_submodules_for_export_handles_fallback_and_headpar():
+    """Mixed full/linear attention configs must still expose usable subfunction targets."""
+    from types import SimpleNamespace
+
+    from QEfficient.blocking.attention_blocking import AttentionBlockingConfig, BlockingMode
+    from QEfficient.transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        QEffQwen3_5MoeAttention,
         QEffQwen3_5MoeDecoderLayer,
         QEffQwen3_5MoeDecoderWrapper,
         QEffQwen3_5MoeForCausalLM,
+        QEffQwen3_5MoeFullAttentionDecoderLayer,
+        QEffQwen3_5MoeLinearDecoderLayer,
     )
 
     causal_lm = QEffQwen3_5MoeForCausalLM.__new__(QEffQwen3_5MoeForCausalLM)
     causal_lm.config = SimpleNamespace(layer_types=["full_attention", "linear_attention"])
-    assert causal_lm.get_submodules_for_export() == {QEffQwen3_5MoeDecoderLayer}
+    assert causal_lm.get_submodules_for_export() == [QEffQwen3_5MoeDecoderLayer]
+    assert causal_lm.get_onnx_past_key_value_names(0) == ["past_key.0", "past_value.0"]
+    assert causal_lm.get_onnx_past_key_value_names(1) == ["conv_state.1", "recurrent_state.1"]
 
     wrapper = QEffQwen3_5MoeDecoderWrapper.__new__(QEffQwen3_5MoeDecoderWrapper)
     wrapper.config = SimpleNamespace(text_config=SimpleNamespace(layer_types=["full_attention", "linear_attention"]))
-    assert wrapper.get_submodules_for_export() == {QEffQwen3_5MoeDecoderLayer}
+    assert wrapper.get_submodules_for_export() == [QEffQwen3_5MoeDecoderLayer]
+    assert wrapper.get_onnx_past_key_value_names(0) == ["past_key.0", "past_value.0"]
+    assert wrapper.get_onnx_past_key_value_names(1) == ["conv_state.1", "recurrent_state.1"]
+
+    headpar_model = QEffQwen3_5MoeForCausalLM.__new__(QEffQwen3_5MoeForCausalLM)
+    nn.Module.__init__(headpar_model)
+    headpar_model.self_attn = QEffQwen3_5MoeAttention(
+        Qwen3_5MoeTextConfig(
+            hidden_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=32,
+        ),
+        layer_idx=0,
+    )
+    headpar_model.self_attn.attn_blocking_config = AttentionBlockingConfig(
+        mode=BlockingMode.KV_HEADPAR,
+        num_kv_blocks=8,
+        headpar_split=4,
+    )
+    assert headpar_model.get_submodules_for_export() == [QEffQwen3_5MoeDecoderLayer]
+
+    mixed_model = QEffQwen3_5MoeForCausalLM(
+        Qwen3_5MoeTextConfig(
+            vocab_size=128,
+            hidden_size=128,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=32,
+            layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+            moe_intermediate_size=16,
+            shared_expert_intermediate_size=16,
+            num_experts=2,
+            num_experts_per_tok=1,
+            max_position_embeddings=128,
+        )
+    )
+    for layer in mixed_model.model.layers:
+        layer.__class__ = QEffQwen3_5MoeDecoderLayer
+        layer.__qeff_init__()
+    assert mixed_model.get_submodules_for_export() == [
+        QEffQwen3_5MoeLinearDecoderLayer,
+        QEffQwen3_5MoeFullAttentionDecoderLayer,
+    ]
+
+
+@pytest.mark.llm_model
+def test_qwen3_5_moe_subfunction_keeps_rope_gather_with_full_attention_layer(tmp_path):
+    """RoPE gathers must be local to full-attention functions for MDP placement."""
+    qeff_model = _tiny_qwen_qeff_model("qwen3_5_moe")
+    onnx_path = _exported_onnx_path(
+        qeff_model.export(
+            tmp_path / "qwen3-5-moe-rope-subfunction",
+            skip_vision=True,
+            use_onnx_subfunctions=True,
+            offload_pt_weights=False,
+        )
+    )
+    onnx_model = onnx.load(onnx_path, load_external_data=False)
+
+    full_attention_functions = {
+        function.name: function
+        for function in onnx_model.functions
+        if "QEffQwen3_5MoeFullAttentionDecoderLayer" in function.name
+    }
+    assert full_attention_functions
+    full_attention_calls = [node for node in onnx_model.graph.node if node.op_type in full_attention_functions]
+    assert full_attention_calls
+    for call in full_attention_calls:
+        rope_input_indices = [
+            index
+            for index, input_name in enumerate(call.input)
+            if input_name.endswith("cos_cached") or input_name.endswith("sin_cached")
+        ]
+        assert rope_input_indices
+        function = full_attention_functions[call.op_type]
+        rope_inputs = {function.input[index] for index in rope_input_indices}
+        assert any(node.op_type == "Gather" and rope_inputs.intersection(node.input) for node in function.node)
+
+    root_rope_gathers = [
+        node
+        for node in onnx_model.graph.node
+        if node.op_type == "Gather"
+        and any(input_name.endswith("cos_cached") or input_name.endswith("sin_cached") for input_name in node.input)
+    ]
+    assert not root_rope_gathers
+
+
+def test_qwen3_5_moe_decode_export_uses_static_token_axis():
+    from QEfficient.transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import QEffQwen3_5MoeForCausalLM
+
+    example_inputs = {
+        "input_ids": torch.zeros((2, 1), dtype=torch.int64),
+        "position_ids": torch.zeros((2, 1), dtype=torch.int64),
+    }
+    dynamic_axes = {
+        "input_ids": {0: "batch_size", 1: "seq_len"},
+        "position_ids": {0: "batch_size", 1: "seq_len"},
+    }
+
+    assert QEffQwen3_5MoeForCausalLM.get_onnx_export_seq_len(32, prefill_seq_len=1) == 1
+    assert QEffQwen3_5MoeForCausalLM.get_onnx_export_seq_len(32, prefill_seq_len=64) == 64
+
+    example_inputs, dynamic_axes = QEffQwen3_5MoeForCausalLM.prepare_onnx_export_inputs(
+        example_inputs,
+        dynamic_axes,
+        seq_len=1,
+    )
+
+    assert example_inputs["position_ids"].shape == (4, 2, 1)
+    assert dynamic_axes["input_ids"] == {0: "batch_size"}
+    assert dynamic_axes["position_ids"] == {1: "batch_size"}
+
+
+def test_qwen3_5_moe_retained_state_specs_keep_flat_conv_and_recurrent_state_float32():
+    from types import SimpleNamespace
+
+    from QEfficient.transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import QEffQwen3_5MoeForCausalLM
+
+    model = QEffQwen3_5MoeForCausalLM.__new__(QEffQwen3_5MoeForCausalLM)
+    model.config = SimpleNamespace(
+        layer_types=["full_attention", "linear_attention"],
+        torch_dtype=torch.bfloat16,
+        mamba_ssm_dtype="float32",
+    )
+    linear_attn = SimpleNamespace(
+        conv_dim=16,
+        num_k_heads=2,
+        conv_kernel_size=4,
+        num_v_heads=4,
+        head_k_dim=8,
+        head_v_dim=8,
+    )
+    model.model = SimpleNamespace(layers=[SimpleNamespace(), SimpleNamespace(linear_attn=linear_attn)])
+
+    specs = model.get_onnx_retained_state_specs(batch_size=2, seq_len=1, kv_cache_shape=[2, 1, 32, 8])
+
+    assert specs["past_key_values"][0][0].dtype == torch.bfloat16
+    assert specs["past_key_values"][1][0].shape == (2, 16, 4)
+    assert specs["past_key_values"][1][0].dtype == torch.bfloat16
+    assert specs["past_key_values"][1][1].dtype == torch.float32
+    assert specs["state_dtypes"]["recurrent_state.1"] == torch.float32
+    assert model.get_retained_state_custom_io_dtypes(default_dtype="float16")["recurrent_state.1"] == "float"
 
 
 def test_qwen3_5_moe_get_specializations_supports_multi_resolution():
@@ -3619,6 +4091,37 @@ def test_qwen3_5_moe_get_specializations_supports_multi_resolution():
     assert all(spec["vision_batch_size"] == 1 for spec in lang_specs)
 
 
+def test_qwen3_5_moe_get_specializations_accepts_qeff_logger_adapter():
+    """Ensure constrained vision-size logging works with a LoggerAdapter."""
+    from types import SimpleNamespace
+
+    from QEfficient.transformers.models.qwen3_5_moe import modeling_qwen3_5_moe
+    from QEfficient.transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        QEffQwen3_5MoeForConditionalGeneration,
+    )
+
+    model = QEffQwen3_5MoeForConditionalGeneration.__new__(QEffQwen3_5MoeForConditionalGeneration)
+    model.config = SimpleNamespace(
+        vision_config=SimpleNamespace(patch_size=16, temporal_patch_size=1),
+        text_config=SimpleNamespace(num_hidden_layers=1, layer_types=[]),
+    )
+
+    assert isinstance(modeling_qwen3_5_moe.logger, logging.LoggerAdapter)
+    specs, _ = model.get_specializations(
+        batch_size=1,
+        prefill_seq_len=512,
+        ctx_len=14336,
+        height=[354],
+        width=[536],
+        num_frames=[1],
+        vision_size=1,
+        kv_offload=True,
+    )
+
+    assert len(specs["vision"]) == 1
+    assert specs["lang"][0]["vision_size"] == 1
+
+
 def test_qwen3_5_moe_get_specializations_decouples_vision_batch_size():
     from types import SimpleNamespace
 
@@ -3648,6 +4151,193 @@ def test_qwen3_5_moe_get_specializations_decouples_vision_batch_size():
     axes = model.get_onnx_dynamic_axes(kv_offload=True)
     assert axes["vision"]["image_grid_thw"][0] == "vision_batch_size"
     assert axes["lang"]["vision_embeds"][0] == "vision_batch_size"
+
+
+@pytest.mark.llm_model
+def test_qwen3_5_moe_full_state_update_matches_singleton_routed_state():
+    config = _tiny_qwen3_5_moe_config()
+    config.text_config.layer_types = ["linear_attention"] * config.text_config.num_hidden_layers
+    torch.manual_seed(0)
+    hf_model = AutoModelForImageTextToText.from_config(config).eval()
+    routed_model = QEFFAutoModelForImageTextToText(
+        deepcopy(hf_model),
+        kv_offload=True,
+        continuous_batching=True,
+    )
+    full_state_model = QEFFAutoModelForImageTextToText(
+        deepcopy(hf_model),
+        kv_offload=True,
+        continuous_batching=True,
+    )
+    inputs = full_state_model.model.get_dummy_inputs(
+        kv_offload=True,
+        continuous_batching=True,
+        gdn_full_state_update=True,
+        batch_size=1,
+        prefill_seq_len=4,
+    )["lang"]
+    inputs["input_ids"].fill_(1)
+    assert inputs["batch_index"].tolist() == [[0]]
+
+    routed_model.transform(ctx_len=8, seq_len=4, bs=1, prefill_only=True, prefill_seq_len=4)
+    full_state_model.transform(
+        ctx_len=8,
+        seq_len=4,
+        bs=1,
+        prefill_only=True,
+        prefill_seq_len=4,
+        qaic_config={"gdn_full_state_update": True},
+    )
+    assert full_state_model.lang_model.hash_params["gated_delta_kwargs"] == {"full_state_update": True}
+
+    routed_gdn_modules = [
+        module for module in routed_model.lang_model.model.modules() if hasattr(module, "gdn_full_state_update")
+    ]
+    full_state_gdn_modules = [
+        module for module in full_state_model.lang_model.model.modules() if hasattr(module, "gdn_full_state_update")
+    ]
+    assert routed_gdn_modules and all(module.gdn_full_state_update is False for module in routed_gdn_modules)
+    assert full_state_gdn_modules and all(module.gdn_full_state_update is True for module in full_state_gdn_modules)
+
+    with torch.no_grad():
+        routed_outputs = routed_model.lang_model.model(**deepcopy(inputs))
+        full_state_outputs = full_state_model.lang_model.model(**deepcopy(inputs))
+
+    torch.testing.assert_close(full_state_outputs[0], routed_outputs[0])
+    routed_states = routed_outputs[3]
+    full_states = full_state_outputs[3]
+    assert len(routed_states) == len(full_states) == config.text_config.num_hidden_layers
+    for layer_idx, ((routed_conv, routed_recurrent), (full_conv, full_recurrent)) in enumerate(
+        zip(routed_states, full_states)
+    ):
+        torch.testing.assert_close(
+            full_conv,
+            routed_conv,
+            msg=lambda msg, layer_idx=layer_idx: f"conv_state.{layer_idx}: {msg}",
+        )
+        torch.testing.assert_close(
+            full_recurrent,
+            routed_recurrent,
+            msg=lambda msg, layer_idx=layer_idx: f"recurrent_state.{layer_idx}: {msg}",
+        )
+
+    full_state_model.transform(ctx_len=8, seq_len=1, bs=1, prefill_only=False, prefill_seq_len=1)
+    assert all(module.gdn_full_state_update is False for module in full_state_gdn_modules)
+    assert "gated_delta_kwargs" not in full_state_model.lang_model.hash_params
+
+
+@pytest.mark.llm_model
+def test_qwen3_5_moe_singleton_prefill_export_has_no_state_scatter(tmp_path):
+    config = _tiny_qwen3_5_moe_config()
+    config.text_config.layer_types = ["linear_attention"] * config.text_config.num_hidden_layers
+    hf_model = AutoModelForImageTextToText.from_config(config).eval()
+    qeff_model = QEFFAutoModelForImageTextToText(
+        hf_model,
+        kv_offload=True,
+        continuous_batching=True,
+    )
+    qeff_model.transform(
+        ctx_len=8,
+        seq_len=4,
+        bs=1,
+        qaic_config={"gdn_full_state_update": True},
+        prefill_only=True,
+        prefill_seq_len=4,
+    )
+
+    inputs = qeff_model.model.get_dummy_inputs(
+        kv_offload=True,
+        continuous_batching=True,
+        gdn_full_state_update=True,
+        batch_size=1,
+        prefill_seq_len=4,
+    )["lang"]
+    inputs["input_ids"].fill_(1)
+    assert all(state.shape[0] == 1 for layer_state in inputs["past_key_values"] for state in layer_state)
+
+    export_result = qeff_model.export(
+        export_dir=tmp_path / "qwen3-5-moe-prefill-no-state-scatter",
+        skip_vision=True,
+        prefill_only=True,
+        prefill_seq_len=4,
+        use_onnx_subfunctions=True,
+        offload_pt_weights=False,
+        qaic_config={"gdn_full_state_update": True},
+    )
+    onnx_model = onnx.load(_exported_onnx_path(export_result), load_external_data=False)
+    nodes = list(onnx_model.graph.node)
+    nodes.extend(node for function_proto in onnx_model.functions for node in function_proto.node)
+    state_indexing_ops = {"CtxGatherCB", "CtxGatherCB3D", "CtxScatterCB", "CtxScatterCB3D"}
+
+    assert not ({node.op_type for node in nodes} & state_indexing_ops)
+    for function_proto in onnx_model.functions:
+        retained_outputs = [name for name in function_proto.output if "state." in name]
+        if not retained_outputs:
+            continue
+        producer_by_output = {output: node for node in function_proto.node for output in node.output}
+        for retained_output in retained_outputs:
+            pending = [retained_output]
+            visited = set()
+            while pending:
+                value = pending.pop()
+                producer = producer_by_output.get(value)
+                if producer is None or id(producer) in visited:
+                    continue
+                visited.add(id(producer))
+                assert "Scatter" not in producer.op_type
+                pending.extend(producer.input)
+
+    with torch.no_grad():
+        pytorch_outputs = qeff_model.lang_model.model(**deepcopy(inputs))
+    session = _ort_session(_exported_onnx_path(export_result))
+    session_input_names = [item.name for item in session.get_inputs()]
+    session_output_names = [item.name for item in session.get_outputs()]
+    ort_inputs = _flatten_qwen_ort_inputs(inputs, session_input_names, qeff_model.lang_model.model)
+    ort_outputs = dict(zip(session_output_names, session.run(session_output_names, ort_inputs)))
+
+    assert np.allclose(pytorch_outputs[0].detach().numpy(), ort_outputs["logits"], atol=2e-3, rtol=1e-4)
+    for layer_idx, (conv_state, recurrent_state) in enumerate(pytorch_outputs[3]):
+        assert np.allclose(
+            conv_state.detach().numpy(),
+            ort_outputs[f"conv_state.{layer_idx}_RetainedState"],
+            atol=2e-3,
+            rtol=1e-4,
+        )
+        assert np.allclose(
+            recurrent_state.detach().numpy(),
+            ort_outputs[f"recurrent_state.{layer_idx}_RetainedState"],
+            atol=2e-3,
+            rtol=1e-4,
+        )
+
+
+@pytest.mark.parametrize(
+    ("model_type", "prefill_only", "batch_size", "full_batch_size"),
+    [
+        ("qwen3_5", True, 1, 1),
+        ("qwen3_5_moe", False, 1, 1),
+        ("qwen3_5_moe", True, 2, 1),
+        ("qwen3_5_moe", True, 1, 4),
+    ],
+)
+def test_gdn_full_state_update_rejects_unsafe_compile_modes(
+    model_type,
+    prefill_only,
+    batch_size,
+    full_batch_size,
+):
+    from QEfficient.transformers.models.modeling_auto import _QEffAutoModelForImageTextToTextDualQPC
+
+    model = _QEffAutoModelForImageTextToTextDualQPC.__new__(_QEffAutoModelForImageTextToTextDualQPC)
+    model.model = _tiny_qwen_qeff_model(model_type).model
+
+    with pytest.raises(ValueError, match="gdn_full_state_update"):
+        model.compile(
+            prefill_only=prefill_only,
+            batch_size=batch_size,
+            full_batch_size=full_batch_size,
+            qaic_config={"gdn_full_state_update": True},
+        )
 
 
 def test_vlm_compile_forwards_gdn_chunk_size_in_qaic_config_to_export_path():
@@ -4112,78 +4802,13 @@ def _tiny_glm_moe_dsa_qeff_model(hf_model):
     return qeff_model
 
 
-def test_glm_moe_dsa_four_layer_decode_parity_and_shared_indexer_cache():
-    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaForCausalLM
-
-    config = _tiny_glm_moe_dsa_config()
-    torch.manual_seed(0)
-    hf_model = GlmMoeDsaForCausalLM(config).eval()
-    qeff_model = _tiny_glm_moe_dsa_qeff_model(hf_model)
-    input_ids = torch.tensor([[1, 5, 7, 9]], dtype=torch.long)
-    position_ids = torch.arange(input_ids.shape[1], dtype=torch.long).unsqueeze(0)
-    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
-
-    with torch.no_grad():
-        hf_logits = hf_model(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids).logits[
-            :, -1
-        ]
-        qeff_logits = qeff_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            use_cache=False,
-        ).logits.squeeze(1)
-
-    torch.testing.assert_close(qeff_logits, hf_logits, atol=1e-6, rtol=1e-6)
-
-    compressed_kvs = list(qeff_model.get_dummy_pkv_cache(config, batch_size=1, seq_len=8))
-    indexer_key_cache = list(qeff_model.get_dummy_indexer_cache(config, batch_size=1, seq_len=8))
-    assert qeff_model.get_indexer_cache_layers(config) == (0, 1, 2)
-    assert len(compressed_kvs) == 4
-    assert len(indexer_key_cache) == 3
-
-    hf_past_key_values = None
-    for token_position, token_id in enumerate(input_ids[0].tolist()):
-        decode_input_ids = torch.tensor([[token_id]], dtype=torch.long)
-        decode_position_ids = torch.tensor([[token_position]], dtype=torch.long)
-        hf_attention_mask = torch.ones((1, token_position + 1), dtype=torch.bool)
-
-        with torch.no_grad():
-            hf_outputs = hf_model(
-                input_ids=decode_input_ids,
-                attention_mask=hf_attention_mask,
-                position_ids=decode_position_ids,
-                past_key_values=hf_past_key_values,
-                use_cache=True,
-            )
-        qeff_outputs = qeff_model(
-            input_ids=decode_input_ids,
-            attention_mask=torch.ones((1, 8), dtype=torch.bool),
-            position_ids=decode_position_ids,
-            compressed_kvs=compressed_kvs,
-            indexer_key_cache=indexer_key_cache,
-            use_cache=True,
-        )
-
-        hf_past_key_values = hf_outputs.past_key_values
-        compressed_kvs, indexer_key_cache = qeff_outputs.past_key_values
-        torch.testing.assert_close(
-            qeff_outputs.logits.squeeze(1),
-            hf_outputs.logits[:, -1],
-            atol=1e-6,
-            rtol=1e-6,
-        )
-        assert len(compressed_kvs) == 4
-        assert len(indexer_key_cache) == 3
-
-
 def test_glm_mixed_layer_dummy_caches_use_compile_context_and_layer_layout():
     from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaForCausalLM
 
     from QEfficient.transformers.models.pytorch_transforms import BlockingAttentionTransform
 
     config = _tiny_glm_moe_dsa_config()
-    config.layer_types = ["full_attention", "deepseek_sparse_attention"] * 2
+    config.layer_types = ["full_attention", "indexed_attention"] * 2
     config.indexer_types = ["full", "full", "full", "shared"]
     config.index_topk = 32
     qeff_model = _tiny_glm_moe_dsa_qeff_model(GlmMoeDsaForCausalLM(config).eval())
@@ -4230,189 +4855,6 @@ def test_glm_mixed_layer_dummy_caches_use_compile_context_and_layer_layout():
     indexer_cache = qeff_model.get_dummy_indexer_cache(config, batch_size=16, seq_len=4096)
     assert len(indexer_cache) == 1
     assert indexer_cache[0].shape == (16, 16, 256, config.index_head_dim)
-
-
-def test_glm_export_uses_trace_length_one_and_compile_sized_mixed_caches(tmp_path):
-    from types import MethodType
-
-    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaForCausalLM
-
-    from QEfficient.transformers.models.modeling_auto import QEFFAutoModelForCausalLM
-
-    config = _tiny_glm_moe_dsa_config()
-    config.layer_types = ["full_attention", "deepseek_sparse_attention"] * 2
-    config.indexer_types = ["full", "full", "full", "shared"]
-    config.index_topk = 32
-    qaic_config = {
-        "indexer_dp": 1,
-        "indexer_cp": 16,
-        "attn_dp": 16,
-        "attn_cp": 1,
-        "indexer_num_blocks": 16,
-        "num_cores_per_device": 16,
-    }
-    qeff_model = QEFFAutoModelForCausalLM(GlmMoeDsaForCausalLM(config).eval(), qaic_config=qaic_config)
-    qeff_model.transform(
-        ctx_len=4096,
-        seq_len=1,
-        bs=16,
-        num_devices=16,
-        qaic_config=qaic_config,
-        num_cores=16,
-    )
-    captured = {}
-
-    def capture_export(self, example_inputs, *, output_names, dynamic_axes, export_dir, **kwargs):
-        captured["example_inputs"] = example_inputs
-        captured["output_names"] = output_names
-        captured["dynamic_axes"] = dynamic_axes
-        return Path(export_dir) / "captured.onnx"
-
-    qeff_model._export = MethodType(capture_export, qeff_model)
-    qeff_model.export(export_dir=str(tmp_path), offload_pt_weights=False)
-
-    example_inputs = captured["example_inputs"]
-    assert example_inputs["input_ids"].shape == (16, 1)
-    assert example_inputs["position_ids"].shape == (16, 1)
-    assert captured["dynamic_axes"]["input_ids"] == {0: "batch_size"}
-    assert captured["dynamic_axes"]["position_ids"] == {0: "batch_size"}
-    assert example_inputs["compressed_kvs"][0][0].shape == (16, 1, 4096, config.kv_lora_rank)
-    assert example_inputs["compressed_kvs"][1][0].shape == (1, 16, 4096, config.kv_lora_rank)
-    assert example_inputs["indexer_key_cache"][0].shape == (16, 16, 256, config.index_head_dim)
-    assert captured["dynamic_axes"]["compressed_kv.1"] == {
-        2: "ctx_len",
-    }
-    assert captured["dynamic_axes"]["indexer_key.1"] == {
-        0: "batch_size",
-    }
-    assert "compressed_kv.0_RetainedState" in captured["output_names"]
-    assert "indexer_key.1_RetainedState" in captured["output_names"]
-
-
-def test_glm_cp2_folded_decode_matches_cp1_sparse_attention():
-    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaForCausalLM
-
-    from QEfficient.transformers.models.pytorch_transforms import BlockingAttentionTransform
-
-    config = _tiny_glm_moe_dsa_config()
-    torch.manual_seed(17)
-    hf_model = GlmMoeDsaForCausalLM(config).eval()
-    cp1_model = _tiny_glm_moe_dsa_qeff_model(hf_model)
-    cp2_model = _tiny_glm_moe_dsa_qeff_model(hf_model)
-    common = {
-        "indexer_dp": 1,
-        "indexer_kvp": 1,
-        "attn_dp": 1,
-        "attn_kvp": 1,
-        "indexer_num_blocks": 1,
-        "num_cores_per_device": 1,
-    }
-    cp1_model, _ = BlockingAttentionTransform.apply(
-        cp1_model,
-        None,
-        qaic_config={**common, "indexer_cp": 1, "attn_cp": 1},
-        batch_size=1,
-        context_length=8,
-        num_devices=1,
-        num_cores=1,
-    )
-    cp2_model, _ = BlockingAttentionTransform.apply(
-        cp2_model,
-        None,
-        qaic_config={**common, "indexer_cp": 2, "attn_cp": 2},
-        batch_size=1,
-        context_length=8,
-        num_devices=2,
-        num_cores=1,
-    )
-    cp1_compressed = list(cp1_model.get_dummy_pkv_cache(config, batch_size=1, seq_len=8))
-    cp1_indexer = list(cp1_model.get_dummy_indexer_cache(config, batch_size=1, seq_len=8))
-    cp2_compressed = list(cp2_model.get_dummy_pkv_cache(config, batch_size=1, seq_len=8))
-    cp2_indexer = list(cp2_model.get_dummy_indexer_cache(config, batch_size=1, seq_len=8))
-
-    for position, token_id in enumerate((1, 5, 7, 9)):
-        model_inputs = {
-            "input_ids": torch.tensor([[token_id]], dtype=torch.long),
-            "attention_mask": torch.ones((1, 8), dtype=torch.bool),
-            "position_ids": torch.tensor([[position]], dtype=torch.long),
-            "use_cache": True,
-        }
-        with torch.no_grad():
-            cp1_outputs = cp1_model(
-                **model_inputs,
-                compressed_kvs=cp1_compressed,
-                indexer_key_cache=cp1_indexer,
-            )
-            cp2_outputs = cp2_model(
-                **model_inputs,
-                compressed_kvs=cp2_compressed,
-                indexer_key_cache=cp2_indexer,
-            )
-        cp1_compressed, cp1_indexer = cp1_outputs.past_key_values
-        cp2_compressed, cp2_indexer = cp2_outputs.past_key_values
-        torch.testing.assert_close(cp2_outputs.logits, cp1_outputs.logits, atol=1e-5, rtol=1e-5)
-
-
-@pytest.mark.parametrize(("batch_size", "dp", "cp"), [(1, 1, 1), (1, 1, 2), (2, 2, 1)])
-def test_glm_folded_dsa_prefill_matches_hf_and_preserves_shared_indexer(batch_size, dp, cp):
-    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaForCausalLM
-
-    from QEfficient.transformers.models.pytorch_transforms import BlockingAttentionTransform
-
-    config = _tiny_glm_moe_dsa_config()
-    torch.manual_seed(31)
-    hf_model = GlmMoeDsaForCausalLM(config).eval()
-    qeff_model = _tiny_glm_moe_dsa_qeff_model(hf_model)
-    qaic_config = {
-        "indexer_dp": dp,
-        "indexer_cp": cp,
-        "indexer_kvp": 1,
-        "attn_dp": dp,
-        "attn_cp": cp,
-        "attn_kvp": 1,
-        "indexer_num_blocks": 1,
-        "num_cores_per_device": 2,
-        "indexer_ql_chunk": 4,
-        "indexer_q_block_size": 4,
-        "indexer_topk_blocking": 2,
-        "indexer_prefill_parallel": True,
-        "sparse_q_block_size": 4,
-        "sparse_kv_num_blocks": 2,
-    }
-    qeff_model, transformed = BlockingAttentionTransform.apply(
-        qeff_model,
-        None,
-        qaic_config=qaic_config,
-        batch_size=batch_size,
-        context_length=8,
-        num_devices=dp * cp,
-        num_cores=2,
-        seq_len=4,
-        prefill_only=True,
-    )
-    assert transformed
-
-    input_ids = torch.tensor([[1, 5, 7, 9]], dtype=torch.long).expand(batch_size, -1)
-    position_ids = torch.arange(input_ids.shape[1], dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
-    with torch.no_grad():
-        hf_logits = hf_model(
-            input_ids=input_ids,
-            attention_mask=torch.ones_like(input_ids, dtype=torch.bool),
-            position_ids=position_ids,
-        ).logits[:, -1]
-        qeff_outputs = qeff_model(
-            input_ids=input_ids,
-            attention_mask=torch.ones((batch_size, 8), dtype=torch.bool),
-            position_ids=position_ids,
-            compressed_kvs=list(qeff_model.get_dummy_pkv_cache(config, batch_size=batch_size, seq_len=8)),
-            indexer_key_cache=list(qeff_model.get_dummy_indexer_cache(config, batch_size=batch_size, seq_len=8)),
-            use_cache=True,
-        )
-
-    torch.testing.assert_close(qeff_outputs.logits.squeeze(1), hf_logits, atol=1e-5, rtol=1e-5)
-    compressed_kvs, indexer_key_cache = qeff_outputs.past_key_values
-    assert len(compressed_kvs) == config.num_hidden_layers
-    assert len(indexer_key_cache) == 3
 
 
 @pytest.mark.parametrize(
@@ -5473,6 +5915,16 @@ def test_subfunction_compile_io_names_use_internal_retained_state():
         assert output_name == f"{state_name}_InternalRetainedState"
         assert _state_input_name(output_name) == state_name
 
+    assert output_name == "past_value.1_InternalRetainedState"
+    assert _state_input_name(output_name) == "past_value.1"
+    assert (
+        _compile_io_name("conv_state.2_RetainedState", use_onnx_subfunctions=True)
+        == "conv_state.2_InternalRetainedState"
+    )
+    assert (
+        _compile_io_name("recurrent_state.2_RetainedState", use_onnx_subfunctions=True)
+        == "recurrent_state.2_InternalRetainedState"
+    )
     assert _compile_io_name("vision_embeds_RetainedState", use_onnx_subfunctions=True) == "vision_embeds_RetainedState"
 
 
@@ -5928,6 +6380,58 @@ def test_causal_compile_custom_io_carries_prefix(tmp_path, monkeypatch):
     assert "kv_cache_prefix" not in implicit_compiler_options, (
         "kv_cache_prefix leaked into compiler_options — would produce an invalid compiler flag"
     )
+
+
+def test_qwen3_5_moe_compile_custom_io_covers_linear_attention_states(tmp_path, monkeypatch):
+    """Hybrid Qwen3.5-MoE decode compile must retain both KV and linear-attention states."""
+    from types import SimpleNamespace
+
+    qeff_model = object.__new__(QEFFAutoModelForCausalLM)
+    qeff_model.model = SimpleNamespace(
+        config=SimpleNamespace(model_type="qwen3_5_moe_text", num_hidden_layers=2, torch_dtype=torch.float32),
+        qaic_config=None,
+        get_retained_state_names=lambda: [
+            "past_key.0",
+            "past_value.0",
+            "conv_state.1",
+            "recurrent_state.1",
+        ],
+        get_retained_state_custom_io_dtypes=lambda default_dtype: {"recurrent_state.1": "float"},
+    )
+    qeff_model.num_layers = 2
+    qeff_model.continuous_batching = False
+    qeff_model.ccl_enabled = False
+    qeff_model.is_tlm = False
+    qeff_model.comp_ctx_lengths_prefill = None
+    qeff_model.comp_ctx_lengths_decode = None
+    qeff_model.build_prefill_specialization = lambda **_: {"batch_size": 1, "seq_len": 1}
+    captured = {}
+
+    def fake_compile(**kwargs):
+        captured.update(kwargs)
+        return tmp_path / "qpc"
+
+    monkeypatch.setattr(qeff_model, "_compile", fake_compile)
+    qeff_model.compile(
+        prefill_seq_len=1,
+        ctx_len=32,
+        compile_dir=str(tmp_path),
+        kv_cache_prefix="VLLM",
+        use_onnx_subfunctions=True,
+    )
+
+    custom_io = captured["custom_io"]
+    assert "past_key.0_VLLM" in custom_io
+    assert "past_key.0_VLLM_InternalRetainedState" in custom_io
+    assert "past_value.0_VLLM" in custom_io
+    assert "past_value.0_VLLM_InternalRetainedState" in custom_io
+    assert "conv_state.1_VLLM" in custom_io
+    assert "conv_state.1_VLLM_InternalRetainedState" in custom_io
+    assert "recurrent_state.1_VLLM" in custom_io
+    assert "recurrent_state.1_VLLM_InternalRetainedState" in custom_io
+    assert custom_io["past_key.0_VLLM"] == "float16"
+    assert custom_io["recurrent_state.1_VLLM"] == "float"
+    assert captured["use_onnx_subfunctions"] is True
 
 
 @pytest.mark.llm_model

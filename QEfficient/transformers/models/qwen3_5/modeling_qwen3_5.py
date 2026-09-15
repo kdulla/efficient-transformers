@@ -49,6 +49,7 @@ from QEfficient.customop import (
     CtxScatterFuncCB3D,
 )
 from QEfficient.customop.rms_norm import CustomRMSNormFunc
+from QEfficient.customop.utils import select_interface
 from QEfficient.transformers.cache_utils import (
     QEffDynamicLayer,
 )
@@ -96,7 +97,7 @@ class QEffQwen3_5GatedDeltaNetCustomRMSNormAIC(nn.Module):
     """
 
     def forward(self, hidden_states, gate):
-        normed = CustomRMSNormFunc.apply(
+        normed = select_interface(CustomRMSNormFunc.apply, torch.ops.qefficient.rms_norm)(
             hidden_states,
             self.weight.to(hidden_states.dtype),
             self.variance_epsilon if hasattr(self, "variance_epsilon") else self.eps,
@@ -227,6 +228,10 @@ class QEffQwen3_5DynamicCache(Cache):
         if layer is None:
             raise ValueError(f"Layer {layer_idx} is not a full_attention layer")
         return layer.read_only_blocked_kv(start_index, end_index, cache_kwargs)
+
+    def read_only_blockedKV(self, start_index: int, end_index: int, layer_idx: int, cache_kwargs: dict):
+        """Compatibility alias for callers using the legacy combined K/V name."""
+        return self.read_only_blocked_kv(start_index, end_index, layer_idx, cache_kwargs)
 
     def read_only_blocked_K(self, start_index: int, end_index: int, layer_idx: int, cache_kwargs: dict):
         layer = self.kv_layers[layer_idx]
@@ -390,7 +395,7 @@ def qeff_apply_interleaved_mrope(freqs, mrope_section):
 def qeff_prepare_mrope_cos_sin(cos, sin, position_ids, mrope_section, dtype=None):
     invalid_pos_mask = position_ids < 0
     safe_position_ids = torch.where(invalid_pos_mask, torch.zeros_like(position_ids), position_ids)
-    flat_pos = safe_position_ids.reshape(-1)
+    flat_pos = safe_position_ids.reshape(-1).to(cos.device)
     cos = cos.index_select(0, flat_pos).reshape(*safe_position_ids.shape, cos.shape[-1])
     sin = sin.index_select(0, flat_pos).reshape(*safe_position_ids.shape, sin.shape[-1])
     cos = qeff_apply_interleaved_mrope(cos, mrope_section).unsqueeze(1)
@@ -444,6 +449,8 @@ def qeff_apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, mrope_section=N
 
     # Keep half or full tensor for later concatenation
     rotary_dim = cos.shape[-1]
+    cos = cos.to(device=q.device)
+    sin = sin.to(device=q.device)
     q_rot, q_pass = q[:, :, :, :rotary_dim], q[:, :, :, rotary_dim:]
     k_rot, k_pass = k[:, :, :, :rotary_dim], k[:, :, :, rotary_dim:]
 
@@ -527,7 +534,6 @@ def qeff_torch_causal_conv1d_update(
         shifted_conv_state = shifted_conv_state.reshape(bsz, num_kv_heads, conv_group_dim, state_len)
         gathered_conv_state = gathered_conv_state.reshape(bsz, num_kv_heads, conv_group_dim, state_len)
     updated_conv_state = torch.where(is_decode, shifted_conv_state, gathered_conv_state)
-
     out = F.conv1d(hidden_states_new, weight.unsqueeze(1), bias, padding=0, groups=hidden_size)
     out = F.silu(out[:, :, -seq_len:]).to(hidden_states.dtype)
     return out, updated_conv_state
@@ -589,7 +595,7 @@ class QEffQwen3_5Attention(Qwen3_5Attention):
                 layer_idx=self.layer_idx,
                 past_key_value=past_key_values,
                 blocking_config=blocking_config,
-                comp_ctx_length=comp_ctx_lengths,
+                comp_ctx_lengths=comp_ctx_lengths,
                 batch_index=batch_index,
                 position_ids=position_ids[0],
                 past_seen_tokens=past_seen_tokens,
@@ -633,8 +639,8 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
 
     def __qeff_init__(self):
         self.chunk_gated_delta_rule = self.torch_chunk_gated_delta_rule_qeff
+        self.chunk_gated_delta_solver = "forward_sub"
         self.torch_dtype = self.out_proj.weight.dtype
-        self.chunk_gated_delta_solver = "tree"
         chunk_size = int(getattr(self, "gdn_chunk_size", 64) or 64)
         if chunk_size <= 0:
             chunk_size = 64
@@ -680,6 +686,16 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
             sub = attn[..., :i, :i].clone()
             attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(dim=-2)
         return attn + eye.to(dtype=attn.dtype)
+
+    def _solve_chunk_attn_forward_sub(self, attn: torch.Tensor, mask: torch.Tensor, eye: torch.Tensor, chunk_size: int):
+        del mask
+        solved_rows = [attn[..., 0, :]]
+        for i in range(1, chunk_size):
+            row = attn[..., i, :i]
+            sub = torch.stack(solved_rows, dim=-2)[..., :i]
+            solved = row + (row.unsqueeze(-1) * sub).sum(dim=-2)
+            solved_rows.append(torch.cat((solved, attn[..., i, i:]), dim=-1))
+        return torch.stack(solved_rows, dim=-2) + eye.to(dtype=attn.dtype)
 
     def _solve_chunk_attn_tree(self, attn: torch.Tensor, mask: torch.Tensor, eye: torch.Tensor, chunk_size: int):
         if chunk_size <= 0 or (chunk_size & (chunk_size - 1)) != 0:
@@ -797,6 +813,8 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
 
     def _solve_chunk_attn(self, attn: torch.Tensor, mask: torch.Tensor, eye: torch.Tensor, chunk_size: int):
         solver = getattr(self, "chunk_gated_delta_solver", "recursive_sns")
+        if solver == "forward_sub":
+            return self._solve_chunk_attn_forward_sub(attn, mask, eye, chunk_size)
         if solver == "original":
             return self._solve_chunk_attn_original(attn, mask, eye, chunk_size)
         if solver in ("tree", "forward_sub_tree"):
@@ -876,7 +894,8 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
             x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1]) for x in (query, key, value, k_beta, v_beta)
         ]
         g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
-        mask = mask_causal
+        mask = mask_causal.to(device=g.device) if mask_causal is not None else None
+        mask_strict = mask_strict.to(device=g.device) if mask_strict is not None else None
 
         # chunk decay
         # g = g.cumsum(dim=-1)
@@ -906,7 +925,7 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
             if initial_state is None
             else initial_state.to(value)
         )
-        core_attn_out = torch.zeros_like(value)
+        output_chunks = []
         mask = mask_strict
 
         # for each chunk
@@ -916,7 +935,7 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
             v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
             v_new = v_i - v_prime
             attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
-            core_attn_out[:, :, i] = attn_inter + attn @ v_new
+            output_chunks.append(attn_inter + attn @ v_new)
             last_recurrent_state = (
                 last_recurrent_state * g[:, :, i, -1, None, None].exp()
                 + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
@@ -924,6 +943,7 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
 
         if not output_final_state:
             last_recurrent_state = None
+        core_attn_out = torch.stack(output_chunks, dim=2)
         core_attn_out = core_attn_out.reshape(
             core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
         )
@@ -1133,7 +1153,7 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
                     last_recurrent_state.to(recurrent_state_all.dtype),
                 )
             else:
-                cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
+                cache_params.recurrent_states[self.layer_idx] = last_recurrent_state.to(recurrent_state_all.dtype)
 
         else:
             # No cache — prefill only, no state needed
@@ -1143,6 +1163,7 @@ class QEffQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
                 value,
                 g=g,
                 beta=beta,
+                position_ids=position_ids,
                 chunk_size=self.gdn_chunk_size,
                 initial_state=None,
                 output_final_state=False,
@@ -1279,8 +1300,8 @@ class QEffQwen3_5TextModel(Qwen3_5TextModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         start, end = resolve_layer_window(QEffQwen3_5TextModel, len(self.layers))
+        past_seen_tokens = past_key_values.get_seq_length(layer_idx=start) if past_key_values is not None else 0
         if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length(layer_idx=start) if past_key_values is not None else 0
             active_layer_type = self.config.layer_types[start] if start < len(self.config.layer_types) else None
             if is_layerwise_active() and position_ids is not None and active_layer_type == "linear_attention":
                 text_position_ids = position_ids[0] if position_ids.ndim == 3 else position_ids
@@ -1297,12 +1318,13 @@ class QEffQwen3_5TextModel(Qwen3_5TextModel):
 
         if isinstance(attention_mask, torch.Tensor):
             target_length = attention_mask.shape[-1]
+        elif past_seen_tokens > 0:
+            # QEff caches are preallocated.  ``past_seen_tokens`` therefore
+            # represents the cache storage length, not the number of tokens
+            # that should be appended to it for this forward pass.
+            target_length = past_seen_tokens
         else:
-            pos_max = 0
-            if position_ids is not None:
-                text_position_ids = position_ids[0] if position_ids.ndim == 3 else position_ids
-                pos_max = int(text_position_ids.max().item()) + 1
-            target_length = max(past_seen_tokens, pos_max)
+            target_length = text_position_ids.shape[-1]
         causal_mask = _create_causal_mask(
             position_ids=text_position_ids, target_length=target_length, sliding_window=None
         )
@@ -1369,11 +1391,6 @@ class QEffQwen3_5TextModel(Qwen3_5TextModel):
 class QEffQwen3_5ForCausalLM(Qwen3_5ForCausalLM):
     def get_submodules_for_export(self) -> Type[nn.Module]:
         return {QEffQwen3_5DecoderLayer}
-
-    def get_onnx_past_key_value_names(self, layer_idx: int, layer_state=None) -> List[str]:
-        if self.config.text_config.layer_types[layer_idx] == "full_attention":
-            return [f"past_key.{layer_idx}", f"past_value.{layer_idx}"]
-        return [f"conv_state.{layer_idx}", f"recurrent_state.{layer_idx}"]
 
     @staticmethod
     def _reorder_cache(past_key_values, beam_idx):
