@@ -19,7 +19,7 @@ from QEfficient.exporter.weight_free.weight_spec import load_weight_spec, resolv
 from QEfficient.utils import load_json
 from QEfficient.utils.checkpoint_utils import resolve_checkpoint_dir
 from QEfficient.utils.logging_utils import logger
-from QEfficient.utils.torch_patches import dynamo_invoke_subgraph_fallback_env
+from QEfficient.utils.torch_patches import dynamo_invoke_subgraph_fallback_env, preserve_subfunction_source_lines
 
 
 def _to_meta(value: Any) -> Any:
@@ -223,7 +223,7 @@ def export_weight_free_onnx(
 
     meta_qeff_model.model.requires_grad_(False)
     torch_onnx_export_start = time.perf_counter()
-    with dynamo_invoke_subgraph_fallback_env():
+    with dynamo_invoke_subgraph_fallback_env(), preserve_subfunction_source_lines():
         onnx_program = torch.onnx.export(
             meta_qeff_model.model,
             args=(),

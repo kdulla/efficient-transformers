@@ -44,6 +44,12 @@ from QEfficient.utils.torch_patches import (
     preserve_subfunction_source_lines,
     temporarily_enable_nested_compile_regions,
 )
+from QEfficient.utils.torch_patches import (
+    _same_export_region,
+    preserve_mixed_export_subfunctions,
+    preserve_subfunction_source_lines,
+    temporarily_enable_nested_compile_regions,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
