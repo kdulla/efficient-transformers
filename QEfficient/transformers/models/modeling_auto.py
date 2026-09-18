@@ -1941,6 +1941,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
         comp_ctx_lengths_decode: list[int] | None = None,
         ctx_len: int | None = None,
         batch_size: int = 1,
+        vision_batch_size: int | None = None,
         full_batch_size: int | None = None,
         kv_cache_batch_size: int | None = None,
         num_devices: int = 1,
@@ -1978,7 +1979,9 @@ class _QEffAutoModelForImageTextToTextDualQPC:
         ctx_len : int, optional
             Maximum context length for the language model. Default is None.
         batch_size : int, optional
-            Batch size. Default is 1.
+            Language prefill/decode batch size. Default is 1.
+        vision_batch_size : int, optional
+            Vision encoder batch size. Defaults to ``batch_size``.
         full_batch_size : int, optional
             Not supported for this model; must be None.
         kv_cache_batch_size : int, optional
@@ -2034,6 +2037,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
                     comp_ctx_lengths_decode=comp_ctx_lengths_decode,
                     ctx_len=ctx_len,
                     batch_size=batch_size,
+                    vision_batch_size=vision_batch_size,
                     full_batch_size=full_batch_size,
                     kv_cache_batch_size=kv_cache_batch_size,
                     num_devices=num_devices,
@@ -2064,6 +2068,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
                 comp_ctx_lengths_decode=comp_ctx_lengths_decode,
                 ctx_len=ctx_len,
                 batch_size=batch_size,
+                vision_batch_size=vision_batch_size,
                 full_batch_size=full_batch_size,
                 kv_cache_batch_size=kv_cache_batch_size,
                 num_devices=num_devices,
@@ -2142,6 +2147,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             continuous_batching=self.continuous_batching,
             kv_cache_batch_size=kv_cache_batch_size,
             full_batch_size=full_batch_size,
+            vision_batch_size=vision_batch_size,
             **compiler_options,
         )
 
