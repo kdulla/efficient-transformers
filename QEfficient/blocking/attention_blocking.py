@@ -140,6 +140,7 @@ class AttentionBlockingConfig:
     ctx_len: Optional[int] = None
     kv_block_unroll: Optional[int] = 1
     par_num_split: Optional[int] = None
+    num_cores_per_device: Optional[int] = None
 
 
 def get_gdn_num_head_blocks(blocking_config: Optional[AttentionBlockingConfig], batch_fold: bool) -> int:
@@ -447,6 +448,7 @@ def generic_blocked_attention_interface(
         skip_kv=blocking_config.skip_kv or False,
         # prefill-specific
         n_rep_chunk=blocking_config.n_rep_chunk,
+        num_cores_per_device=blocking_config.num_cores_per_device,
         # MLA-specific
         **(mla_kwargs or {}),
         **kwargs,
