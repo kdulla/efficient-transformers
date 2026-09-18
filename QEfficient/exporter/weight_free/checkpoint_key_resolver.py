@@ -43,6 +43,7 @@ _COMPUTED_INITIALIZER_NAMES = {
     "embed_positions",
     "embed_scale",
     "_qeff_conv_positions",
+    "sinks",
 }
 
 
