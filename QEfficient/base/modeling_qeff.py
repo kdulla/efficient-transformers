@@ -48,6 +48,7 @@ from QEfficient.generation.cloud_infer import QAICInferenceSession
 from QEfficient.transformers.models.pytorch_transforms import (
     BlockingAttentionTransform,
     GatedDeltaConfigTransform,
+    FFNBlockingTransform,
     OptimizedMoETransform,
     ReplicateKVHeadTransform,
 )
@@ -1098,6 +1099,7 @@ class QEFFBaseModel(ABC):
             self.hash_params["gated_delta_kwargs"] = gated_delta_config
         else:
             self.hash_params.pop("gated_delta_kwargs", None)
+        self.model, _ = FFNBlockingTransform.apply(self.model, qaic_config=qaic_config)
         if qaic_config is not None:
             self.hash_params["qsa_config"] = {
                 key: qaic_config[key]
