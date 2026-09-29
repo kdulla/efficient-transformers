@@ -29,6 +29,7 @@ from QEfficient.blocking.blocked_attention_forwards import (
     blocked_qkv_attention_forward,
     blocked_qkv_attention_forward_prefill_headpar_offline,
     blocked_qkv_attention_forward_prefill_online,
+    paged_gqa_attention_forward,
 )
 
 
@@ -37,6 +38,7 @@ class BlockingMode(str, Enum):
     AUTO = "auto"  # We choose the best blocking mode based on the input configuration
     # decode
     KV = "kv"
+    KV_MINIMAX_DEDICATED = "kv_minimax_dedicated"
     KV_HEADPAR = "kv_headpar"
     KV_BATCH_FOLD = "kv_batch_fold"
     Q = "q"
@@ -57,7 +59,7 @@ class BlockingMode(str, Enum):
 
     @classmethod
     def resolve(cls, mode: Optional[str | "BlockingMode"]) -> "BlockingMode":
-        if mode is None:
+        if mode is None or mode == "none":
             return cls.NONE
         resolved_mode = cls(mode)
         if resolved_mode == cls.AUTO:
@@ -139,8 +141,38 @@ class AttentionBlockingConfig:
     n_rep_chunk: Optional[int] = None
     ctx_len: Optional[int] = None
     kv_block_unroll: Optional[int] = 1
+    par_num_split: Optional[int] = None
     num_cores_per_device: Optional[int] = None
     paged_attention: Optional[bool] = False
+    paged_gqa: Optional[bool] = False
+    attn_dp: Optional[int] = 1
+    attn_cp: Optional[int] = 1
+    # MiniMax M3 MSA-specific options
+    msa_attn_dp: Optional[int] = None
+    msa_attn_cp: Optional[int] = None
+    msa_attn_dp_local_batch_size: Optional[int] = None
+    msa_indexer_dp: Optional[int] = None
+    msa_indexer_cp: Optional[int] = None
+    indexer_n_head: Optional[int] = None
+    indexer_q_size: Optional[int] = None
+    indexer_q_chunk: Optional[int] = None
+    indexer_q_proj_num_chunks: Optional[int] = None
+    indexer_prefill_parallel: Optional[bool] = None
+    indexer_num_blocks: Optional[int] = None
+    msa_num_kv_blocks: Optional[int] = None
+    msa_q_chunk: Optional[int] = None
+    prefill_compile_seq_len: Optional[int] = None
+    prefill_export_seq_len: Optional[int] = None
+    page_block_size: Optional[int] = None
+    gqa_page_block_size: Optional[int] = None
+    msa_indexer_page_block_size: Optional[int] = None
+    msa_attn_page_block_size: Optional[int] = None
+    num_logical_pages: Optional[int] = None
+    msa_indexer_num_logical_pages: Optional[int] = None
+    msa_attn_num_logical_pages: Optional[int] = None
+    gqa_physical_pages: Optional[int] = None
+    msa_indexer_physical_pages: Optional[int] = None
+    msa_attn_physical_pages: Optional[int] = None
 
 
 def get_gdn_num_head_blocks(blocking_config: Optional[AttentionBlockingConfig], batch_fold: bool) -> int:
@@ -253,6 +285,7 @@ def recurrent_gdn_decode_forward(
 BLOCKING_MODE_REQUIRED_PARAMS: Dict[BlockingMode, list] = {
     # decode
     BlockingMode.KV: ["num_kv_blocks"],
+    BlockingMode.KV_MINIMAX_DEDICATED: ["num_kv_blocks"],
     BlockingMode.KV_BATCH_FOLD: ["num_kv_blocks"],
     BlockingMode.KV_HEADPAR: ["num_kv_blocks"],
     BlockingMode.Q: ["num_q_blocks"],
@@ -308,6 +341,19 @@ def _get_sliding_window_len(past_key_value: Cache, layer_idx: Optional[int] = No
     if hasattr(past_key_value, "sliding_window_len"):
         return past_key_value.sliding_window_len
     return past_key_value.get_sliding_window_len(layer_idx)
+
+
+def _uses_blocked_kv_cache(mode: BlockingMode) -> bool:
+    return (
+        mode == BlockingMode.KV
+        or mode == BlockingMode.KV_HEADPAR
+        or mode == BlockingMode.KV_BATCH_FOLD
+        or mode == BlockingMode.KV_MINIMAX_DEDICATED
+        or mode == BlockingMode.QKV
+        or mode == BlockingMode.HKV
+        or mode == BlockingMode.HQKV
+        or mode == BlockingMode.BHQKV
+    )
 
 
 # helper function needed both in generic blocked approach and in other modeling files for non-blocked approach
@@ -368,13 +414,64 @@ def generic_blocked_attention_interface(
     mla_kwargs: Optional[Dict[str, Any]] = None,
     is_mla: bool = False,
     prefill_only: bool = False,
+    auxiliary_state: Optional[Any] = None,
     **kwargs,
 ):
+    model_strategy = getattr(module, "qeff_attention_strategy", None)
+    if model_strategy is not None:
+        return model_strategy(
+            module=module,
+            query=query,
+            key=key,
+            value=value,
+            attention_mask=attention_mask,
+            scaling=scaling,
+            layer_idx=layer_idx,
+            past_key_value=past_key_value,
+            blocking_config=blocking_config,
+            comp_ctx_lengths=comp_ctx_lengths,
+            batch_index=batch_index,
+            position_ids=position_ids,
+            past_seen_tokens=past_seen_tokens,
+            non_blocked_forward=non_blocked_forward,
+            score_mod=score_mod,
+            position_bias=position_bias,
+            sinks=sinks,
+            sliding_window=sliding_window,
+            mla_kwargs=mla_kwargs,
+            is_mla=is_mla,
+            prefill_only=prefill_only,
+            auxiliary_state=auxiliary_state,
+            **kwargs,
+        )
+
+    if blocking_config is None:
+        blocking_config = AttentionBlockingConfig()
     blocking_mode = BlockingMode.resolve(blocking_config.mode)
     prefill_only = prefill_only or blocking_mode.is_prefill
-    strategy = _STRATEGIES[
-        BlockingMode.get_final_mode(blocking_config, prefill_only=prefill_only, is_mla=is_mla, mla_kwargs=mla_kwargs)
-    ]
+    mode = BlockingMode.get_final_mode(blocking_config, prefill_only=prefill_only, is_mla=is_mla, mla_kwargs=mla_kwargs)
+    strategy = _STRATEGIES[mode]
+
+    # Keep a zero-valued, layer-local dependency in the traced graph for
+    # batch-folded decode. The folded-cache index/mask expressions are built
+    # by the layer-specific attention forward below. Without this dependency,
+    # ONNX export can treat those expressions as identical across decoder
+    # layers, lift them out of the subfunction body, and expose them as extra
+    # subfunction inputs/outputs. Besides producing unnecessary subfunction
+    # variants, that prevents the AIC compiler from applying its range
+    # optimizations. The dependency is intentionally numerical no-op: it
+    # preserves position_ids while anchoring the graph to this layer's cache.
+    if blocking_mode == BlockingMode.KV_BATCH_FOLD and past_key_value is not None and position_ids is not None:
+        layers = getattr(past_key_value, "layers", None)
+        # Dynamic caches can start with no layer entries during initial tracing.
+        # In that case, there is no cache tensor to use as a graph dependency;
+        # leave position_ids unchanged until the requested layer is available.
+        layer = layers[layer_idx] if layers is not None and layer_idx is not None and layer_idx < len(layers) else None
+        layer_keys = getattr(layer, "keys", None)
+        if layer_keys is not None:
+            cache_shape = torch._shape_as_tensor(layer_keys)
+            layer_local_zero = (cache_shape[0] - cache_shape[0]).to(dtype=position_ids.dtype)
+            position_ids = position_ids + layer_local_zero
 
     cache_kwargs = {"position_ids": position_ids, "batch_index": batch_index}
 
@@ -384,9 +481,19 @@ def generic_blocked_attention_interface(
         and supports_paged_attention_blocked_kv(past_key_value)
     )
 
+    use_paged_gqa = use_paged_kv_blocked and bool(blocking_config.paged_gqa)
+
     if not is_mla:
         cache_kwargs["past_seen_tokens"] = past_seen_tokens
-        if use_paged_kv_blocked and sliding_window is None:
+        if use_paged_gqa:
+            if sliding_window is not None:
+                raise NotImplementedError("Sliding-window attention is not supported with paged GQA.")
+            cache_kwargs = {
+                "batch_index": batch_index,
+                "position_ids": position_ids,
+                "block_table": block_table,
+            }
+        elif use_paged_kv_blocked and sliding_window is None:
             cache_kwargs = {
                 "batch_index": batch_index,
                 "position_ids": position_ids,
@@ -408,8 +515,8 @@ def generic_blocked_attention_interface(
                 )
             past_key_value.write_only(key, value, module.layer_idx, cache_kwargs)
         elif past_key_value is not None:
-            use_kv_blocked = "kv" in blocking_config.mode and supports_blocked_kv(past_key_value)
-            if blocking_mode == BlockingMode.KV_BATCH_FOLD:
+            use_kv_blocked = _uses_blocked_kv_cache(mode) and supports_blocked_kv(past_key_value)
+            if mode == BlockingMode.KV_BATCH_FOLD:
                 past_key_value.write_only_batch(key, value, module.layer_idx, cache_kwargs)
             elif use_kv_blocked and sliding_window is None:
                 past_key_value.write_only(key, value, module.layer_idx, cache_kwargs)
@@ -429,6 +536,29 @@ def generic_blocked_attention_interface(
                     position_ids=position_ids,
                     sliding_window=sliding_window,
                 )
+
+    if use_paged_gqa:
+        return paged_gqa_attention_forward(
+            module=module,
+            query=query,
+            key=key,
+            value=value,
+            attention_mask=attention_mask,
+            scaling=scaling,
+            num_kv_blocks=blocking_config.num_kv_blocks,
+            cache_kwargs=cache_kwargs,
+            layer_idx=layer_idx,
+            past_key_value=past_key_value,
+            ctx_len=blocking_config.ctx_len,
+            skip_kv=blocking_config.skip_kv or False,
+            attn_dp=blocking_config.attn_dp or 1,
+            attn_cp=blocking_config.attn_cp or 1,
+            page_block_size=blocking_config.gqa_page_block_size or blocking_config.page_block_size,
+            num_cores_per_device=blocking_config.num_cores_per_device or 1,
+            num_q_blocks=blocking_config.num_q_blocks or 1,
+            q_blocks_per_outer=blocking_config.n_rep_chunk or 1,
+            head_block_size=blocking_config.head_block_size or 1,
+        )
 
     attn_output, attn_weights = strategy(
         # common
