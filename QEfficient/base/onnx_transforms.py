@@ -33,6 +33,8 @@ from QEfficient.customop.ctx_scatter_gather import (
     CtxGatherDPFunc,
     CtxGatherFoldedRows,
     CtxGatherFoldedRowsFunc,
+    CtxGatherBlockedKVDP,
+    CtxGatherBlockRangeKVDP,
     CtxGatherFunc,
     CtxGatherFunc3D,
     CtxGatherFunc3DGeneralized,
@@ -42,6 +44,12 @@ from QEfficient.customop.ctx_scatter_gather import (
     CtxGatherRowsFunc,
     CtxPagedScatter,
     CtxPagedScatterFunc,
+    CtxGatherFuncBlockedKVDP,
+    CtxGatherFuncBlockRangeKVDP,
+    CtxGatherFuncPagedKVDP,
+    CtxGatherPagedKVDP,
+    CtxPagedScatterDP,
+    CtxPagedScatterFuncDP,
     CtxScatter,
     CtxScatter3D,
     CtxScatter3DInt,
@@ -55,6 +63,8 @@ from QEfficient.customop.ctx_scatter_gather import (
     CtxScatterFunc3D,
     CtxScatterFunc3DGeneralized,
     CtxScatterFunc3DInt,
+    M3CtxScatter,
+    M3CtxScatterFunc,
 )
 from QEfficient.customop.ctx_scatter_gather_cb import (
     CtxGatherBlockedKVCB,
@@ -73,6 +83,7 @@ from QEfficient.customop.quantization_ops import CastToUInt4, CastToUInt4Func
 from QEfficient.customop.rms_norm import CustomRMSNorm, CustomRMSNormFunc
 from QEfficient.utils import constants
 from QEfficient.utils.constants import FILE_CHUNK_SIZE_DEFAULT, SIZE_THRESHOLD_DEFAULT
+from QEfficient.utils.export_profiler import PROFILER
 
 logger = logging.getLogger(__name__)
 
@@ -309,6 +320,7 @@ class CustomOpTransform(BaseOnnxTransform):
     _custom_ops: Dict[str, Tuple[Any, Any]] = {
         "CustomRMSNormFunc": (CustomRMSNormFunc, CustomRMSNorm),
         "CtxScatterFunc": (CtxScatterFunc, CtxScatter),
+        "M3CtxScatterFunc": (M3CtxScatterFunc, M3CtxScatter),
         "CtxScatterFunc3D": (CtxScatterFunc3D, CtxScatter3D),
         "CtxScatterFunc3DInt": (CtxScatterFunc3DInt, CtxScatter3DInt),
         "CtxScatterFunc3DGeneralized": (CtxScatterFunc3DGeneralized, CtxScatter3D),
@@ -324,6 +336,10 @@ class CustomOpTransform(BaseOnnxTransform):
         "CtxScatterFuncCB3D": (CtxScatterFuncCB3D, CtxScatterCB3D),
         "CtxGatherFuncCB3D": (CtxGatherFuncCB3D, CtxGatherCB3D),
         "CtxGatherFuncBlockedKV": (CtxGatherFuncBlockedKV, CtxGatherBlockedKV),
+        "CtxGatherFuncBlockedKVDP": (CtxGatherFuncBlockedKVDP, CtxGatherBlockedKVDP),
+        "CtxGatherFuncBlockRangeKVDP": (CtxGatherFuncBlockRangeKVDP, CtxGatherBlockRangeKVDP),
+        "CtxGatherFuncPagedKVDP": (CtxGatherFuncPagedKVDP, CtxGatherPagedKVDP),
+        "CtxPagedScatterFuncDP": (CtxPagedScatterFuncDP, CtxPagedScatterDP),
         "CtxGatherFuncBlockedKVCB": (CtxGatherFuncBlockedKVCB, CtxGatherBlockedKVCB),
         "CtxScatterFuncCB": (CtxScatterFuncCB, CtxScatterCB),
         "CtxGatherFuncCB": (CtxGatherFuncCB, CtxGatherCB),
@@ -527,6 +543,7 @@ class PreserveNestedCacheRetainedStateTransform(BaseOnnxTransform):
     _SCATTER_OP_TYPES = frozenset(
         {
             "CtxScatter",
+            "M3CtxScatter",
             "CtxScatterCB",
             "CtxScatter3D",
             "CtxScatter3DInt",
@@ -922,6 +939,12 @@ class RenameRepeatedSubgraphTransform(BaseOnnxTransform):
 
         if not old_to_new:
             return False
+
+        # Loop-body functions are named "<subgraph>__<body>"; keep them attached to the renamed parent.
+        for fn in model.functions:
+            parent, separator, body = fn.name.partition("__")
+            if separator and parent in old_to_new:
+                old_to_new[fn.name] = f"{old_to_new[parent]}__{body}"
 
         for fn in model.functions:
             if fn.name in old_to_new:
@@ -1667,6 +1690,11 @@ class OnnxTransformPipeline(BaseOnnxTransform):
 
         if AdapterWeightsToInputsTransform in requested:
             applied[AdapterWeightsToInputsTransform] = AdapterWeightsToInputsTransform.apply(model, **kwargs)
+
+        for transform in self.transforms:
+            if getattr(transform, "_apply_with_pipeline_kwargs", False):
+                with PROFILER.stage(f"onnx transform {transform.__name__}"):
+                    applied[transform] = transform.apply(model, **kwargs)
 
         for t, done in applied.items():
             logger.info(f"Transform '{t.__name__}' applied={done}")

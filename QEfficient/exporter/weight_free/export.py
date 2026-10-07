@@ -21,6 +21,13 @@ from QEfficient.exporter.weight_free.checkpoint_key_resolver import promote_init
 from QEfficient.exporter.weight_free.weight_spec import load_weight_spec, resolve_weight_spec_path, save_weight_spec
 from QEfficient.utils import load_json, resolve_torch_dtype
 from QEfficient.utils.checkpoint_utils import read_weight_map, resolve_checkpoint_dir
+from QEfficient.utils.export_profiler import (
+    PROFILER,
+    dynamo_phase_report,
+    loop_unroll_budget,
+    maybe_cprofile,
+    torch_export_internals_timed,
+)
 from QEfficient.utils.logging_utils import QEFFLogger
 from QEfficient.utils.torch_patches import (
     dynamo_invoke_subgraph_fallback_env,
@@ -363,49 +370,59 @@ def export_weight_free_onnx(
     # experts), not the decoder block class, so the classes export_wrapper already
     # resolved remain correct.
 
+    PROFILER.reset()
     meta_example_inputs = _to_meta(example_inputs)
     model_ref = meta_qeff_model.hash_params["pretrained_model_name_or_path"]
 
     meta_qeff_model.model.requires_grad_(False)
-    export_start_time = time.perf_counter()
-    with dynamo_invoke_subgraph_fallback_env(), isolate_invoke_subgraph_cache(), preserve_subfunction_source_lines():
-        onnx_program = torch.onnx.export(
-            meta_qeff_model.model,
-            args=(),
-            f=None,
-            kwargs=meta_example_inputs,
-            input_names=input_names,
-            output_names=output_names,
-            dynamic_axes=None,
-            dynamic_shapes=dynamic_shapes,
-            **export_kwargs,
-        )
-    export_end_time = time.perf_counter()
-    print(f"Weight-free dynamo export completed in {export_end_time - export_start_time:.2f} seconds")
+    PROFILER.note("loop_unroll_budget", loop_unroll_budget(meta_qeff_model.model))
+    PROFILER.note("export_kwargs", {k: v for k, v in export_kwargs.items() if k != "custom_translation_table"})
+    with PROFILER.stage("torch.onnx.export (capture + decompose + translate)"):
+        with (
+            dynamo_invoke_subgraph_fallback_env(),
+            isolate_invoke_subgraph_cache(),
+            preserve_subfunction_source_lines(),
+            torch_export_internals_timed(),
+            maybe_cprofile(Path(onnx_path).parent),
+        ):
+            onnx_program = torch.onnx.export(
+                meta_qeff_model.model,
+                args=(),
+                f=None,
+                kwargs=meta_example_inputs,
+                input_names=input_names,
+                output_names=output_names,
+                dynamic_axes=None,
+                dynamic_shapes=dynamic_shapes,
+                **export_kwargs,
+            )
+    dynamo_phase_report()
     if onnx_program is None:
         raise RuntimeError("torch.onnx.export returned None for weight-free dynamo export")
     _restore_embedded_initializers(onnx_program, getattr(meta_qeff_model, "_weight_free_embedded_buffers", {}))
 
-    prep_start = time.perf_counter()
-    prepared_model_ref = _prepare_checkpoint_for_weight_free_export(meta_qeff_model, model_ref, target_dtype)
-    prep_duration_seconds = time.perf_counter() - prep_start
-    print(f"Weight-free checkpoint preparation completed in {prep_duration_seconds:.2f} seconds: {prepared_model_ref}")
+    with PROFILER.stage("checkpoint preparation"):
+        prep_start = time.perf_counter()
+        prepared_model_ref = _prepare_checkpoint_for_weight_free_export(meta_qeff_model, model_ref, target_dtype)
+        prep_duration_seconds = time.perf_counter() - prep_start
     logger.info(
         "Weight-free checkpoint preparation completed in %.2fs: %s",
         prep_duration_seconds,
         prepared_model_ref,
     )
 
-    spec = promote_initializers_and_build_spec(
-        onnx_program=onnx_program,
-        model_ref=prepared_model_ref,
-        model_name=qeff_model.model_name,
-        qeff_model=meta_qeff_model,
-    )
-    _prune_unused_fake_initializers(onnx_program)
-    _materialize_computed_initializers(onnx_program, meta_qeff_model)
-    onnx_program.save(str(onnx_path))
-    save_weight_spec(resolve_weight_spec_path(onnx_path), spec)
+    with PROFILER.stage("weight spec build"):
+        spec = promote_initializers_and_build_spec(
+            onnx_program=onnx_program,
+            model_ref=prepared_model_ref,
+            model_name=qeff_model.model_name,
+            qeff_model=meta_qeff_model,
+        )
+    with PROFILER.stage("prune + save raw ONNX"):
+        _prune_unused_fake_initializers(onnx_program)
+        _materialize_computed_initializers(onnx_program, meta_qeff_model)
+        onnx_program.save(str(onnx_path))
+        save_weight_spec(resolve_weight_spec_path(onnx_path), spec)
 
     return meta_qeff_model, onnx_transform_kwargs
 
