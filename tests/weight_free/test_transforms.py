@@ -236,6 +236,7 @@ def test_checkpoint_root_symlinked_shards(tmp_path, monkeypatch):
 
 
 class TestWeightFreeCheckpointTransforms:
+<<<<<<< HEAD
     def test_prepares_native_deepseek_v4_checkpoint(self, tmp_path):
         src = tmp_path / "src"
         out = tmp_path / "out"
@@ -309,7 +310,7 @@ class TestWeightFreeCheckpointTransforms:
         assert decoded.dtype == torch.float32
         torch.testing.assert_close(decoded, scale.to(torch.float32))
 
-    def test_pipeline_limits_checkpoint_to_configured_decoder_layers(self, tmp_path):
+    def test_pipeline_reuses_full_checkpoint_across_configured_decoder_layer_counts(self, tmp_path):
         src = tmp_path / "src"
         out = tmp_path / "out"
         src.mkdir()
@@ -323,7 +324,20 @@ class TestWeightFreeCheckpointTransforms:
             },
         )
 
-        CheckpointTransformPipeline([DtypeConversionCheckpointTransform]).apply(
+        pipeline = CheckpointTransformPipeline([DtypeConversionCheckpointTransform])
+        plan_two_layers, _ = pipeline.build_plan(
+            src,
+            target_dtype=torch.float32,
+            config=SimpleNamespace(num_hidden_layers=2),
+        )
+        plan_three_layers, _ = pipeline.build_plan(
+            src,
+            target_dtype=torch.float32,
+            config=SimpleNamespace(num_hidden_layers=3),
+        )
+        assert plan_two_layers.fingerprint_payload() == plan_three_layers.fingerprint_payload()
+
+        pipeline.apply(
             src,
             out,
             target_dtype=torch.float32,
@@ -334,6 +348,7 @@ class TestWeightFreeCheckpointTransforms:
             "model.embed_tokens.weight",
             "model.layers.0.self_attn.q_proj.weight",
             "model.layers.1.self_attn.q_proj.weight",
+            "model.layers.2.self_attn.q_proj.weight",
         }
 
     def test_pipeline_replicates_kv_projection_weights_and_tracks_plan_parameters(self, tmp_path):
