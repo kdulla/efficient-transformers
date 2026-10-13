@@ -11,6 +11,8 @@ from QEfficient.customop.ctx_scatter_gather import (
     CtxGatherFunc3D,
     CtxGatherFunc3DGeneralized,
     CtxGatherFuncBlockedKV,
+    CtxGatherRowsFunc,
+    CtxPagedScatterFunc,
     CtxGatherFuncBlockedKVBatch,
     CtxGatherFuncPagedAttention,
     CtxScatterFunc,
@@ -48,6 +50,7 @@ from QEfficient.customop.utils import (
     ctx_gather_3d_generalized,
     ctx_gather_blocked_kv,
     ctx_gather_blocked_kv_cb,
+    ctx_gather_rows,
     ctx_gather_cb,
     ctx_gather_cb_3d,
     ctx_scatter,
@@ -56,6 +59,7 @@ from QEfficient.customop.utils import (
     ctx_scatter_3d_int,
     ctx_scatter_cb,
     ctx_scatter_cb_3d,
+    ctx_paged_scatter,
 )
 
 __all__ = [
@@ -73,6 +77,8 @@ __all__ = [
     "CtxGatherFunc3D",
     "CtxGatherFunc3DGeneralized",
     "CtxGatherFuncBlockedKV",
+    "CtxGatherRowsFunc",
+    "CtxPagedScatterFunc",
     "CtxGatherFuncPagedAttention",
     "CtxScatterFuncCB",
     "CtxScatterFuncCB3D",
@@ -95,6 +101,8 @@ __all__ = [
     "ctx_scatter_cb_3d",
     "ctx_gather_cb",
     "ctx_gather_blocked_kv_cb",
+    "ctx_gather_rows",
+    "ctx_paged_scatter",
     "ctx_gather_cb_3d",
     "glm_folded_row_gather",
     "glm_paged_scatter",
