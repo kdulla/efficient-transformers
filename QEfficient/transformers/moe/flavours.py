@@ -73,7 +73,6 @@ def supports_moe_flavour(module, flavour: Union[MoEFlavour, str]) -> bool:
 
 def reduce_nsp_tree(values: torch.Tensor, num_lanes: int) -> torch.Tensor:
     """Reduce lane outputs with the tree pattern used by Qwen3-VL-MoE expert parallelism."""
-    logger.warning(f"Reducing {values.shape} across {num_lanes} lanes using tree reduction")
     current = values
     width = num_lanes
     while width > 1:

@@ -371,6 +371,47 @@ class TestWeightFreeCheckpointTransforms:
             prepared["model.layers.0.self_attn.q_proj.weight"], torch.ones(4, 4, dtype=torch.float16)
         )
 
+    def test_qwen3_original_layout_exposes_source_parameter_names(self):
+        from transformers import Qwen3MoeConfig
+
+        from QEfficient.transformers.models.qwen3_moe.modeling_qwen3_moe import QEffQwen3MoeExperts
+
+        experts = QEffQwen3MoeExperts(
+            Qwen3MoeConfig(num_experts=2, hidden_size=4, moe_intermediate_size=6, intermediate_size=6)
+        )
+        experts._qeff_use_original_checkpoint = True
+
+        weights = experts.transform_weights()
+        parameter_names = {name for name, _ in experts.named_parameters()}
+
+        assert parameter_names == {
+            f"{expert}.{projection}.weight"
+            for expert in ("0", "1")
+            for projection in ("gate_proj", "up_proj", "down_proj")
+        }
+        assert tuple(weights.gate.shape) == (2, 4, 6)
+        assert tuple(weights.up.shape) == (2, 4, 6)
+        assert tuple(weights.down.shape) == (2, 6, 4)
+
+    def test_gpt_oss_original_layout_splits_fused_source_weights_in_forward(self):
+        from transformers import GptOssConfig
+
+        from QEfficient.transformers.models.gpt_oss.modeling_gpt_oss import QEffGptOssExperts
+
+        experts = QEffGptOssExperts(GptOssConfig(num_local_experts=2, hidden_size=4, intermediate_size=6))
+        source = {name: parameter.detach().clone() for name, parameter in experts.named_parameters()}
+        experts._qeff_use_original_checkpoint = True
+
+        weights = experts.transform_weights()
+
+        torch.testing.assert_close(weights.gate, source["gate_up_proj"][..., ::2])
+        torch.testing.assert_close(weights.up, source["gate_up_proj"][..., 1::2])
+        torch.testing.assert_close(weights.down, source["down_proj"])
+        torch.testing.assert_close(weights.gate_bias, source["gate_up_proj_bias"][..., ::2])
+        torch.testing.assert_close(weights.up_bias, source["gate_up_proj_bias"][..., 1::2])
+        torch.testing.assert_close(weights.down_bias, source["down_proj_bias"])
+        assert set(dict(experts.named_parameters())) == set(source)
+
     def test_checkpoint_pipeline_rebuilds_when_source_changes(self, tmp_path):
         src = tmp_path / "src"
         out = tmp_path / "out"
@@ -860,6 +901,55 @@ class TestWeightFreeCheckpointTransforms:
 
         _write_safetensors_checkpoint(tmp_path, {"a": torch.ones(3, 5), "b": torch.ones(7)})
         assert _safetensors_shapes(str(tmp_path / "model.safetensors")) == {"a": [3, 5], "b": [7]}
+
+    @staticmethod
+    def _weight_graph(source_dtype, target_dtype):
+        weight = ir.Value(name="weight", shape=[2, 2], type=ir.TensorType(target_dtype))
+        hidden = ir.Value(name="hidden", shape=[2, 2], type=ir.TensorType(ir.DataType.FLOAT))
+        output = ir.Value(name="output", shape=[2, 2], type=ir.TensorType(ir.DataType.FLOAT))
+        matmul = ir.Node(
+            domain="",
+            op_type="MatMul",
+            inputs=[weight, hidden],
+            outputs=[output],
+            name="matmul",
+            version=17,
+        )
+        graph = ir.Graph(
+            inputs=[hidden],
+            outputs=[output],
+            nodes=[matmul],
+            initializers=[weight],
+            opset_imports={"": 17},
+        )
+        from QEfficient.exporter.weight_free.checkpoint_key_resolver import _promote_initializer
+
+        _promote_initializer(SimpleNamespace(graph=graph), "weight", weight, source_dtype)
+        return graph
+
+    def test_original_bfloat16_weight_casts_to_fp16_graph_dtype(self):
+        graph = self._weight_graph(ir.DataType.BFLOAT16, ir.DataType.FLOAT16)
+
+        assert [(value.name, value.dtype) for value in graph.inputs] == [
+            ("hidden", ir.DataType.FLOAT),
+            ("weight", ir.DataType.BFLOAT16),
+        ]
+        assert [node.op_type for node in graph] == ["Cast", "MatMul"]
+        cast, matmul = list(graph)
+        assert cast.attributes["to"].value == int(ir.DataType.FLOAT16)
+        assert matmul.inputs[0].name == cast.outputs[0].name
+        assert not graph.initializers
+
+    def test_original_bfloat16_weight_has_no_cast_for_bfloat16_graph_dtype(self):
+        graph = self._weight_graph(ir.DataType.BFLOAT16, ir.DataType.BFLOAT16)
+
+        assert [(value.name, value.dtype) for value in graph.inputs] == [
+            ("hidden", ir.DataType.FLOAT),
+            ("weight", ir.DataType.BFLOAT16),
+        ]
+        assert [node.op_type for node in graph] == ["MatMul"]
+        assert list(graph)[0].inputs[0].name == "weight"
+        assert not graph.initializers
 
     def test_scheduler_waits_for_staged_dependency(self, tmp_path):
         execution_order = []
