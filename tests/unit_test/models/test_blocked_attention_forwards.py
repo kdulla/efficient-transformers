@@ -29,6 +29,7 @@ from QEfficient.blocking.blocked_attention_forwards import (
     blocked_bhqkv_attention_forward,
     blocked_hqkv_attention_forward,
     blocked_qkv_attention_forward,
+    paged_gqa_attention_forward,
     repeat_kv,
 )
 from QEfficient.transformers.cache_utils import QEffDynamicCache, QEffDynamicLayer
@@ -89,6 +90,48 @@ def _identity_block_table(batch, num_kv_blocks):
 
 def _cache_kwargs(position_ids, block_table):
     return {"position_ids": position_ids, "block_table": block_table}
+
+
+@pytest.mark.cache
+def test_paged_gqa_decode_matches_manual_causal_attention():
+    num_kv_heads = 1
+    num_query_heads = 2
+    cache = _make_paged_cache(heads=num_kv_heads)
+    module = _DummyModule(num_key_value_groups=num_query_heads // num_kv_heads)
+    query = torch.randn(1, num_query_heads, 1, HEAD_DIM)
+    key = torch.randn(1, num_kv_heads, 1, HEAD_DIM)
+    value = torch.randn(1, num_kv_heads, 1, HEAD_DIM)
+    position_ids = torch.tensor([[CTX_LEN - 1]])
+    block_table = torch.arange(NUM_PHYS_BLOCKS).view(1, 1, NUM_PHYS_BLOCKS)
+
+    output, weights = paged_gqa_attention_forward(
+        module=module,
+        query=query,
+        key=key,
+        value=value,
+        attention_mask=None,
+        scaling=SCALING,
+        num_kv_blocks=2,
+        cache_kwargs={"position_ids": position_ids, "block_table": block_table},
+        layer_idx=0,
+        past_key_value=cache,
+        ctx_len=CTX_LEN,
+        attn_dp=1,
+        attn_cp=1,
+        page_block_size=BLOCK_SIZE,
+        num_cores_per_device=1,
+    )
+
+    key_cache = cache.layers[0].keys
+    value_cache = cache.layers[0].values
+    key_full = key_cache[:, 0].reshape(CTX_LEN, HEAD_DIM).unsqueeze(0)
+    value_full = value_cache[:, 0].reshape(CTX_LEN, HEAD_DIM).unsqueeze(0)
+    key_full = repeat_kv(key_full.unsqueeze(0), module.num_key_value_groups).squeeze(0)
+    value_full = repeat_kv(value_full.unsqueeze(0), module.num_key_value_groups).squeeze(0)
+    expected = _manual_causal_attention(query, key_full, value_full, position_ids, SCALING)
+
+    assert weights is None
+    assert torch.allclose(output, expected.transpose(1, 2), atol=1e-4, rtol=1e-4)
 
 
 # ---------------------------------------------------------------------------

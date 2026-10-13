@@ -4058,9 +4058,11 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
 
         bs: int = constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE
         seq_len: int = constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN
+        decode_only_export = prefill_only is False and prefill_seq_len == 1
         fbs: int = constants.ONNX_EXPORT_EXAMPLE_FBS
 
         supports_paged_attention = False
+        supports_paged_gqa = False
         # increase seq_len if using a larger number of blocks and set PagedAttention params if required
         if self.hash_params.get("blocking_kwargs", None):
             blocking_kwargs = self.hash_params["blocking_kwargs"]
@@ -4074,10 +4076,27 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             seq_len = block_size * max_blocks
             num_kv_blocks = self.hash_params["blocking_kwargs"].num_kv_blocks
             supports_paged_attention = self.hash_params["blocking_kwargs"].paged_attention
+            supports_paged_gqa = supports_paged_attention and blocking_kwargs.mode == BlockingMode.KV_HEADPAR
+            if supports_paged_gqa:
+                bs = max(
+                    bs,
+                    int(
+                        (
+                            blocking_kwargs.attn_dp
+                            if blocking_kwargs is not None
+                            else self.model.qaic_config.get("attn_dp")
+                        )
+                        or 1
+                    ),
+                )
 
             seq_len = kv_block_size = (
                 -(-blocking_kwargs.ctx_len // num_kv_blocks) if supports_paged_attention else seq_len
             )
+
+        kv_cache_seq_len = seq_len
+        if decode_only_export:
+            seq_len = 1
 
         # TODO: Remove this hack ##################
         if dynamo:
@@ -4089,7 +4108,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         kv_cache_shape = get_padding_shape_from_config(
             self.model.config,
             fbs if self.continuous_batching else bs,
-            seq_len * 2 if getattr(self, "dflash_dlm", None) else seq_len,
+            kv_cache_seq_len * 2 if getattr(self, "dflash_dlm", None) else kv_cache_seq_len,
         )
         if dynamo:
             kv_cache_shape = list(kv_cache_shape)
@@ -4132,11 +4151,11 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             block_size = -(-seq_len // max_blocks)
             for_loop_number_forced_by_blocking = block_size * max_blocks
 
-        if expert_parallel_is_triggered:
+        if expert_parallel_is_triggered and not decode_only_export:
             seq_len = (for_loop_number_forced_by_expert_parallel * seq_len) // math.gcd(
                 for_loop_number_forced_by_expert_parallel, seq_len
             )
-        if blocking_enabled:
+        if blocking_enabled and not decode_only_export:
             seq_len = (for_loop_number_forced_by_blocking * seq_len) // math.gcd(
                 for_loop_number_forced_by_blocking, seq_len
             )
@@ -4187,19 +4206,81 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
 
         if supports_paged_attention:
             batch, num_kv_heads, CL, dh = kv_cache_shape
-            total_num_kv_blocks = batch * num_kv_blocks
-            kv_cache_shape = [total_num_kv_blocks, num_kv_heads, kv_block_size, dh]
-            example_inputs["block_table"] = torch.arange((bs * num_kv_blocks), dtype=torch.int64).view(
-                bs, num_kv_blocks
-            )
-            example_inputs["slot_id"] = torch.zeros(bs, dtype=torch.int64)
-            dynamic_axes["block_table"] = {0: "batch_size"}
-            dynamic_axes["slot_id"] = {0: "batch_size"}
-            # Assuming 4d pkv, might have to recheck for GPTBigCode with 3d pkv
-            pkv_dynamic_axes = {
-                0: "total_num_kv_blocks",
-                2: "kv_block_size",
-            }
+            if supports_paged_gqa:
+                attn_dp = int(
+                    (blocking_kwargs.attn_dp if blocking_kwargs is not None else self.model.qaic_config.get("attn_dp"))
+                    or 1
+                )
+                attn_cp = int(
+                    (blocking_kwargs.attn_cp if blocking_kwargs is not None else self.model.qaic_config.get("attn_cp"))
+                    or 1
+                )
+                page_block_size = int(
+                    (
+                        blocking_kwargs.gqa_page_block_size
+                        if blocking_kwargs is not None
+                        else self.model.qaic_config.get("gqa_page_block_size")
+                    )
+                    or (
+                        blocking_kwargs.page_block_size
+                        if blocking_kwargs is not None
+                        else self.model.qaic_config.get("page_block_size")
+                    )
+                )
+                if bs % attn_dp:
+                    raise ValueError(f"Paged GQA export batch size {bs} must be divisible by attn_dp={attn_dp}.")
+                if blocking_kwargs.ctx_len % (attn_cp * page_block_size):
+                    raise ValueError("Paged GQA ctx_len must be divisible by attn_cp * page_block_size.")
+                batch_local = bs // attn_dp
+                minimum_logical_pages = blocking_kwargs.ctx_len // page_block_size
+                configured_num_logical_pages = blocking_kwargs.gqa_num_logical_pages
+                num_logical_pages = (
+                    minimum_logical_pages if configured_num_logical_pages is None else int(configured_num_logical_pages)
+                )
+                if num_logical_pages < minimum_logical_pages:
+                    raise ValueError(
+                        "Paged GQA logical-page capacity must cover ctx_len: "
+                        f"{num_logical_pages} pages < {minimum_logical_pages}."
+                    )
+                num_page_groups = math.ceil(num_logical_pages / attn_cp)
+                required_physical_pages = attn_dp * batch_local * num_page_groups
+                configured_physical_pages = blocking_kwargs.gqa_physical_pages
+                physical_pages = (
+                    required_physical_pages if configured_physical_pages is None else int(configured_physical_pages)
+                )
+                if physical_pages < required_physical_pages:
+                    raise ValueError(
+                        "Paged GQA physical-page capacity must hold every block-table entry: "
+                        f"{physical_pages} pages < {required_physical_pages}."
+                    )
+                kv_cache_shape = [
+                    physical_pages,
+                    attn_dp * attn_cp * num_kv_heads,
+                    page_block_size,
+                    dh,
+                ]
+                example_inputs["block_table"] = torch.arange(required_physical_pages, dtype=torch.int64).view(
+                    attn_dp, batch_local, num_page_groups
+                )
+                dynamic_axes["block_table"] = {1: "gqa_batch_local", 2: "gqa_page_groups"}
+                pkv_dynamic_axes = {
+                    0: "gqa_physical_pages",
+                    2: "gqa_page_size",
+                }
+            else:
+                total_num_kv_blocks = batch * num_kv_blocks
+                kv_cache_shape = [total_num_kv_blocks, num_kv_heads, kv_block_size, dh]
+                example_inputs["block_table"] = torch.arange((bs * num_kv_blocks), dtype=torch.int64).view(
+                    bs, num_kv_blocks
+                )
+                example_inputs["slot_id"] = torch.zeros(bs, dtype=torch.int64)
+                dynamic_axes["block_table"] = {0: "batch_size"}
+                dynamic_axes["slot_id"] = {0: "batch_size"}
+                # Assuming 4d pkv, might have to recheck for GPTBigCode with 3d pkv
+                pkv_dynamic_axes = {
+                    0: "total_num_kv_blocks",
+                    2: "kv_block_size",
+                }
 
         # TODO Update the get_padding_shape_from_config method to handle the case when the model config has attention_chunk_size or sliding_window and it should return a list of shapes for each layer
         if hasattr(self.model, "get_onnx_retained_state_specs"):
@@ -4445,6 +4526,9 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                 prefill_seq_len=prefill_seq_len,
                 ctx_len=ctx_len,
                 **kwargs,
+                kv_cache_batch_size=kv_cache_batch_size,
+                full_batch_size=full_batch_size,
+                continuous_batching=self.continuous_batching,
             )[0]
         else:
             spec = {
@@ -4463,10 +4547,26 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         if full_batch_size:
             spec["full_batch_exec_size"] = exec_batch_size
         if self.model.qaic_config is not None and "paged" in self.model.qaic_config.get("blocking_mode", ""):
-            num_kv_blocks = self.model.qaic_config["num_kv_blocks"]
-            spec["num_kv_blocks"] = num_kv_blocks
-            spec["total_num_kv_blocks"] = kv_cache_batch_size * num_kv_blocks
-            spec["kv_block_size"] = -(-ctx_len // num_kv_blocks)
+            qaic_config = self.model.qaic_config
+            is_paged_gqa = "kv_headpar" in qaic_config.get("blocking_mode", "")
+            if is_paged_gqa:
+                cache_batch_size = kv_cache_batch_size or full_batch_size or exec_batch_size
+                gqa_dp = int(qaic_config.get("attn_dp") or 1)
+                gqa_cp = int(qaic_config.get("attn_cp") or 1)
+                gqa_page_size = int(qaic_config.get("gqa_page_block_size") or qaic_config.get("page_block_size"))
+                gqa_num_pages = int(qaic_config.get("gqa_num_logical_pages") or math.ceil(ctx_len / gqa_page_size))
+                gqa_page_groups = math.ceil(gqa_num_pages / gqa_cp)
+                gqa_physical_pages = int(qaic_config.get("gqa_physical_pages") or cache_batch_size * gqa_page_groups)
+                spec["gqa_batch_local"] = cache_batch_size // gqa_dp
+                spec["gqa_page_size"] = gqa_page_size
+                spec["gqa_num_pages"] = gqa_num_pages
+                spec["gqa_page_groups"] = gqa_page_groups
+                spec["gqa_physical_pages"] = gqa_physical_pages
+            else:
+                num_kv_blocks = self.model.qaic_config["num_kv_blocks"]
+                spec["num_kv_blocks"] = num_kv_blocks
+                spec["total_num_kv_blocks"] = kv_cache_batch_size * num_kv_blocks
+                spec["kv_block_size"] = -(-ctx_len // num_kv_blocks)
         result = {k: v for k, v in spec.items() if v is not None}
         result["_graph_name"] = "Decode" if prefill_seq_len == 1 and kwargs.get("prefill_only") is False else "Prefill"
         return result
@@ -4512,6 +4612,9 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             return None
         if hasattr(self.model, "get_specializations"):
             spec = self.model.get_specializations(
+                kv_cache_batch_size=kv_cache_batch_size,
+                full_batch_size=full_batch_size,
+                continuous_batching=self.continuous_batching,
                 batch_size=full_batch_size if self.continuous_batching else batch_size,
                 prefill_seq_len=(num_speculative_tokens + 1) if self.is_tlm else 1,
                 ctx_len=ctx_len,
@@ -4535,10 +4638,26 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         else:
             spec["batch_size"] = kv_cache_batch_size
         if self.model.qaic_config is not None and "paged" in self.model.qaic_config.get("blocking_mode", ""):
-            num_kv_blocks = self.model.qaic_config["num_kv_blocks"]
-            spec["num_kv_blocks"] = num_kv_blocks
-            spec["total_num_kv_blocks"] = kv_cache_batch_size * num_kv_blocks
-            spec["kv_block_size"] = -(-ctx_len // num_kv_blocks)
+            qaic_config = self.model.qaic_config
+            is_paged_gqa = "kv_headpar" in qaic_config.get("blocking_mode", "")
+            if is_paged_gqa:
+                cache_batch_size = kv_cache_batch_size or full_batch_size or batch_size
+                gqa_dp = int(qaic_config.get("attn_dp") or 1)
+                gqa_cp = int(qaic_config.get("attn_cp") or 1)
+                gqa_page_size = int(qaic_config.get("gqa_page_block_size") or qaic_config.get("page_block_size"))
+                gqa_num_pages = int(qaic_config.get("gqa_num_logical_pages") or math.ceil(ctx_len / gqa_page_size))
+                gqa_page_groups = math.ceil(gqa_num_pages / gqa_cp)
+                gqa_physical_pages = int(qaic_config.get("gqa_physical_pages") or cache_batch_size * gqa_page_groups)
+                spec["gqa_batch_local"] = cache_batch_size // gqa_dp
+                spec["gqa_page_size"] = gqa_page_size
+                spec["gqa_num_pages"] = gqa_num_pages
+                spec["gqa_page_groups"] = gqa_page_groups
+                spec["gqa_physical_pages"] = gqa_physical_pages
+            else:
+                num_kv_blocks = self.model.qaic_config["num_kv_blocks"]
+                spec["num_kv_blocks"] = num_kv_blocks
+                spec["total_num_kv_blocks"] = kv_cache_batch_size * num_kv_blocks
+                spec["kv_block_size"] = -(-ctx_len // num_kv_blocks)
         result = {k: v for k, v in spec.items() if v is not None}
         result["_graph_name"] = "Decode"
         return result
@@ -4656,6 +4775,8 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         """
         reject_legacy_moe_prefill_packed_chunk_size(compiler_options)
         _ignore_public_mdp_ts_num_devices(compiler_options)
+        if qaic_config := compiler_options.get("qaic_config"):
+            self.model.qaic_config = qaic_config
         enable_chunking = override_gptoss_prefill_chunking(self.model.config, prefill_only, enable_chunking)
         if layerwise:
             warnings.warn(

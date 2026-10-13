@@ -59,6 +59,8 @@ def _make_mock_session(
     full_batch_size=None,
     include_sampler=False,
     force_seq_len=None,
+    block_table_shape=None,
+    include_slot_id=False,
 ):
     """
     Build a MagicMock that mimics QAICInferenceSession well enough for
@@ -84,6 +86,10 @@ def _make_mock_session(
     ]
     if full_batch_size is not None:
         bindings.append(_binding("batch_index", [full_batch_size, 1], "input"))
+    if block_table_shape is not None:
+        bindings.append(_binding("block_table", list(block_table_shape), "input"))
+    if include_slot_id:
+        bindings.append(_binding("slot_id", [batch_size], "input"))
 
     session.bindings = bindings
     session.binding_index_map = {b.name: i for i, b in enumerate(bindings)}
@@ -124,6 +130,9 @@ def _make_base_instance(
     batch_size=BATCH_SIZE,
     ctx_len=CTX_LEN,
     full_batch_size=None,
+    block_table_shape=None,
+    include_slot_id=False,
+    num_kv_blocks=None,
 ):
     """
     Construct a QEffTextGenerationBase with a mocked session.
@@ -136,6 +145,8 @@ def _make_base_instance(
         batch_size=batch_size,
         ctx_len=ctx_len,
         full_batch_size=full_batch_size,
+        block_table_shape=block_table_shape,
+        include_slot_id=include_slot_id,
     )
 
     with patch(
@@ -147,6 +158,7 @@ def _make_base_instance(
             qpc_path="/fake/path/model.qpc",
             ctx_len=ctx_len,
             full_batch_size=full_batch_size,
+            num_kv_blocks=num_kv_blocks,
         )
     return obj, tok, mock_session
 
@@ -525,6 +537,15 @@ class TestQEffTextGenerationBaseConstruction:
         obj, _, mock_session = _make_base_instance()
         mock_session.skip_buffers.assert_called()
 
+    def test_rank_three_block_table_enables_paged_gqa(self):
+        obj, _, _ = _make_base_instance(
+            block_table_shape=(1, 1, 8),
+            num_kv_blocks=4,
+        )
+
+        assert obj.uses_paged_gqa is True
+        assert obj.create_block_table(1).shape == (1, 1, 8)
+
 
 # ---------------------------------------------------------------------------
 # Tests: initialize_decode_inputs
@@ -602,6 +623,18 @@ class TestPrepareDecodeInputs:
         obj.initialize_decode_inputs(1, 1, 10)
         decode_inputs = obj.prepare_decode_inputs()
         assert "batch_index" not in decode_inputs
+
+    def test_paged_gqa_decode_uses_rank_three_table_without_slot_id(self):
+        obj, _, _ = _make_base_instance(
+            block_table_shape=(1, 1, 8),
+            num_kv_blocks=4,
+        )
+        obj.initialize_decode_inputs(1, 1, 10)
+
+        decode_inputs = obj.prepare_decode_inputs()
+
+        assert decode_inputs["block_table"].shape == (1, 1, 8)
+        assert "slot_id" not in decode_inputs
 
 
 # ---------------------------------------------------------------------------
@@ -714,6 +747,24 @@ class TestRunPrefill:
         obj.initialize_decode_inputs(1, 1, CTX_LEN)
         _, position_ids, _ = obj.run_prefill(prompt=["Hello world"], generation_len=None)
         assert position_ids.shape[0] == 1  # batch dim
+
+    def test_paged_gqa_prefill_passes_rank_three_table_without_slot_id(self):
+        obj, _, mock_session = _make_base_instance(
+            block_table_shape=(1, 1, 8),
+            num_kv_blocks=4,
+        )
+        obj.initialize_decode_inputs(1, 1, CTX_LEN)
+        block_table = obj.create_block_table(1)
+
+        obj.run_prefill(
+            prompt=["Hello world"],
+            generation_len=None,
+            block_table=block_table,
+        )
+
+        run_inputs = mock_session.run.call_args.args[0]
+        assert run_inputs["block_table"].shape == (1, 1, 8)
+        assert "slot_id" not in run_inputs
 
 
 # ---------------------------------------------------------------------------
@@ -1353,3 +1404,51 @@ class TestGemma4DissVariant:
             "image_idx": np.array([[0]], dtype=np.int64),
         }
         assert "mm_token_type_ids" not in decode_inputs
+
+
+class TestPagedGQACacheRepack:
+    def test_dp1_cp1_preserves_cache(self):
+        from examples.text_generation.qwen3_moe_paged_gqa import _repack_paged_gqa_cache
+
+        cache = np.arange(4 * 2 * 2, dtype=np.float16).reshape(4, 2, 2, 1)
+        block_table = np.arange(4, dtype=np.int64).reshape(1, 1, 4)
+
+        repacked = _repack_paged_gqa_cache(
+            cache,
+            block_table,
+            block_table,
+            cache.shape,
+            dp=1,
+            cp=1,
+        )
+
+        np.testing.assert_array_equal(repacked, cache)
+
+    def test_dp2_cp2_maps_pages_and_leaves_extra_capacity_zeroed(self):
+        from examples.text_generation.qwen3_moe_paged_gqa import _repack_paged_gqa_cache
+
+        batch_size = 4
+        num_pages = 4
+        prefill_table = np.arange(batch_size * num_pages, dtype=np.int64).reshape(1, batch_size, num_pages)
+        decode_table = np.arange(8, dtype=np.int64).reshape(2, 2, 2)
+        cache = np.arange(batch_size * num_pages, dtype=np.float16).reshape(-1, 1, 1, 1)
+
+        repacked = _repack_paged_gqa_cache(
+            cache,
+            prefill_table,
+            decode_table,
+            (10, 4, 1, 1),
+            dp=2,
+            cp=2,
+        )
+
+        for batch_idx in range(batch_size):
+            dp_idx, local_idx = divmod(batch_idx, 2)
+            for logical_page in range(num_pages):
+                page_group, cp_idx = divmod(logical_page, 2)
+                destination_page = decode_table[dp_idx, local_idx, page_group]
+                destination_row = dp_idx * 2 + cp_idx
+                source_page = prefill_table[0, batch_idx, logical_page]
+                assert repacked[destination_page, destination_row, 0, 0] == cache[source_page, 0, 0, 0]
+
+        np.testing.assert_array_equal(repacked[8:], np.zeros((2, 4, 1, 1), dtype=np.float16))

@@ -29,6 +29,7 @@ from QEfficient.blocking.blocked_attention_forwards import (
     blocked_qkv_attention_forward,
     blocked_qkv_attention_forward_prefill_headpar_offline,
     blocked_qkv_attention_forward_prefill_online,
+    paged_gqa_attention_forward,
 )
 
 
@@ -141,6 +142,12 @@ class AttentionBlockingConfig:
     kv_block_unroll: Optional[int] = 1
     num_cores_per_device: Optional[int] = None
     paged_attention: Optional[bool] = False
+    attn_dp: Optional[int] = 1
+    attn_cp: Optional[int] = 1
+    page_block_size: Optional[int] = None
+    gqa_page_block_size: Optional[int] = None
+    gqa_num_logical_pages: Optional[int] = None
+    gqa_physical_pages: Optional[int] = None
 
 
 def get_gdn_num_head_blocks(blocking_config: Optional[AttentionBlockingConfig], batch_fold: bool) -> int:
@@ -374,10 +381,19 @@ def generic_blocked_attention_interface(
         and blocking_config.paged_attention
         and supports_paged_attention_blocked_kv(past_key_value)
     )
+    use_paged_gqa = use_paged_kv_blocked and blocking_mode == BlockingMode.KV_HEADPAR
 
     if not is_mla:
         cache_kwargs["past_seen_tokens"] = past_seen_tokens
-        if use_paged_kv_blocked and sliding_window is None:
+        if use_paged_gqa:
+            if sliding_window is not None:
+                raise NotImplementedError("Sliding-window attention is not supported with paged GQA.")
+            cache_kwargs = {
+                "batch_index": batch_index,
+                "position_ids": position_ids,
+                "block_table": block_table,
+            }
+        elif use_paged_kv_blocked and sliding_window is None:
             cache_kwargs = {
                 "batch_index": batch_index,
                 "position_ids": position_ids,
@@ -420,6 +436,29 @@ def generic_blocked_attention_interface(
                     position_ids=position_ids,
                     sliding_window=sliding_window,
                 )
+
+    if use_paged_gqa:
+        return paged_gqa_attention_forward(
+            module=module,
+            query=query,
+            key=key,
+            value=value,
+            attention_mask=attention_mask,
+            scaling=scaling,
+            num_kv_blocks=blocking_config.num_kv_blocks,
+            cache_kwargs=cache_kwargs,
+            layer_idx=layer_idx,
+            past_key_value=past_key_value,
+            ctx_len=blocking_config.ctx_len,
+            skip_kv=blocking_config.skip_kv or False,
+            attn_dp=blocking_config.attn_dp or 1,
+            attn_cp=blocking_config.attn_cp or 1,
+            page_block_size=blocking_config.gqa_page_block_size or blocking_config.page_block_size,
+            num_cores_per_device=blocking_config.num_cores_per_device or 1,
+            num_q_blocks=blocking_config.num_q_blocks or 1,
+            q_blocks_per_outer=blocking_config.n_rep_chunk or 1,
+            head_block_size=blocking_config.head_block_size or 1,
+        )
 
     attn_output, attn_weights = strategy(
         # common

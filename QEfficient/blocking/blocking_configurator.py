@@ -410,7 +410,19 @@ def build_transformer_blocking_config_for_transform(
         blocking_config.batch_fold = True
 
     # optional blocking parameters to set if given in qaic_config
-    for param in ("skip_kv", "n_rep_chunk", "ctx_len", "kv_block_unroll", "num_cores_per_device"):
+    for param in (
+        "skip_kv",
+        "n_rep_chunk",
+        "ctx_len",
+        "kv_block_unroll",
+        "num_cores_per_device",
+        "attn_dp",
+        "attn_cp",
+        "page_block_size",
+        "gqa_page_block_size",
+        "gqa_num_logical_pages",
+        "gqa_physical_pages",
+    ):
         if qaic_config.get(param) is not None:
             setattr(blocking_config, param, qaic_config.get(param))
 

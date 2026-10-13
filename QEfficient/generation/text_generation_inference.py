@@ -488,6 +488,11 @@ class QEffTextGenerationBase:
         )  # Check and fetch full batch size if CB is enabled
         self.num_kv_blocks = num_kv_blocks
         self.kv_block_size = -(-self._ctx_len // self.num_kv_blocks) if num_kv_blocks else 1
+        self.block_table_shape = None
+        if "block_table" in self._session.binding_index_map:
+            block_table_binding = self._session.bindings[self._session.binding_index_map["block_table"]]
+            self.block_table_shape = tuple(int(dim) for dim in block_table_binding.dims)
+        self.uses_paged_gqa = self.block_table_shape is not None and len(self.block_table_shape) == 3
 
         # Initialize the storage variables.
         self.batch_index = None
@@ -507,6 +512,23 @@ class QEffTextGenerationBase:
         # Skip inputs/outputs
         self._session.skip_buffers(
             [x for x in self._session.input_names + self._session.output_names if is_retained_state_name(x)]
+        )
+
+    def create_block_table(self, batch_size: int) -> Optional[np.ndarray]:
+        if not self.num_kv_blocks:
+            return None
+        if self.uses_paged_gqa:
+            attn_dp, batch_local, num_page_groups = self.block_table_shape
+            if batch_size != attn_dp * batch_local:
+                raise ValueError(
+                    f"Paged GQA runtime batch size {batch_size} does not match "
+                    f"block_table shape {self.block_table_shape}."
+                )
+            return np.arange(attn_dp * batch_local * num_page_groups, dtype=np.int64).reshape(
+                self.block_table_shape
+            )
+        return np.arange(batch_size * self.num_kv_blocks, dtype=np.int64).reshape(
+            batch_size, self.num_kv_blocks
         )
 
     def _set_tokenizer_params(self):
@@ -631,10 +653,9 @@ class QEffTextGenerationBase:
         batch_size = self.full_batch_size if self.full_batch_size is not None else self.batch_size
         decode_inputs = {}
         if self.num_kv_blocks:
-            decode_inputs["block_table"] = np.arange(batch_size * self.num_kv_blocks, dtype=np.int64).reshape(
-                batch_size, self.num_kv_blocks
-            )
-            decode_inputs["slot_id"] = (self.decode_pos_ids % self.kv_block_size).reshape(batch_size)
+            decode_inputs["block_table"] = self.create_block_table(batch_size)
+            if "slot_id" in self._session.input_names:
+                decode_inputs["slot_id"] = (self.decode_pos_ids % self.kv_block_size).reshape(batch_size)
         if self.is_tlm:
             position_ids = np.full((batch_size, self._decode_seq_len), -1, dtype=np.int64)
             position_ids[:, -1] = self.decode_pos_ids.flatten()
@@ -817,7 +838,8 @@ class QEffTextGenerationBase:
 
         if block_table is not None:
             inputs["block_table"] = block_table
-            inputs["slot_id"] = np.zeros((prefill_logit_bs), dtype=np.int64)
+            if "slot_id" in self._session.input_names:
+                inputs["slot_id"] = np.zeros((prefill_logit_bs), dtype=np.int64)
 
         if decode_batch_id is not None:
             inputs["batch_index"] = decode_batch_id
@@ -861,7 +883,7 @@ class QEffTextGenerationBase:
             chunk_inputs["position_ids"] = inputs["position_ids"][
                 :, i * self._prefill_seq_len : (i + 1) * self._prefill_seq_len
             ]
-            if block_table is not None:
+            if block_table is not None and "slot_id" in self._session.input_names:
                 chunk_start_position_id = i * self._prefill_seq_len
                 chunk_inputs["slot_id"] = np.full(
                     (prefill_logit_bs,), chunk_start_position_id % self.kv_block_size, dtype=np.int64
@@ -1053,7 +1075,7 @@ class QEffTextGenerationBase:
             # Prepare inputs for next iteration
             decode_inputs["input_ids"] = self._fetch_next_token_id(outputs)
             decode_inputs["position_ids"][:, -1] += 1
-            if self.num_kv_blocks:
+            if self.num_kv_blocks and "slot_id" in decode_inputs:
                 decode_inputs["slot_id"][:] += 1
                 decode_inputs["slot_id"][:] %= self.kv_block_size
             cache_index += 1
@@ -1166,13 +1188,7 @@ class TextGeneration:
             self._full_batch_size if self._full_batch_size is not None else self._qaic_model.batch_size
         )
         max_gen_length = self._ctx_len if not generation_len else max(self._ctx_len, generation_len)
-        self._qaic_model.block_table = (
-            np.arange(execution_batch_size * self._num_kv_blocks, dtype=np.int64).reshape(
-                execution_batch_size, self._num_kv_blocks
-            )
-            if self._num_kv_blocks
-            else None
-        )
+        self._qaic_model.block_table = self._qaic_model.create_block_table(execution_batch_size)
 
         # Create a prompt queue.
         self._prompt_queue = deque(prompt)
@@ -1210,7 +1226,10 @@ class TextGeneration:
             self._text_streamer = transformers.TextStreamer(self._tokenizer)
         start = perf_counter()
         outputs, position_ids, generation_len = self._qaic_model.run_prefill(
-            prompt, generation_len, prefill_logit_bs=self._qaic_model.batch_size
+            prompt,
+            generation_len,
+            prefill_logit_bs=self._qaic_model.batch_size,
+            block_table=self._qaic_model.block_table,
         )
         self._qaic_model.update_decode_input(outputs, position_ids, generation_len)
 
@@ -1293,7 +1312,10 @@ class TextGeneration:
         self._setup_model_execution_inputs(prompt, generation_len, prompt_to_lora_id_mapping)
         start = perf_counter()
         outputs, position_ids, generation_len = self._qaic_model.run_prefill(
-            prompt, generation_len, prefill_logit_bs=self._qaic_model.batch_size
+            prompt,
+            generation_len,
+            prefill_logit_bs=self._qaic_model.batch_size,
+            block_table=self._qaic_model.block_table,
         )
         self._qaic_model.update_decode_input(outputs, position_ids, generation_len)
 

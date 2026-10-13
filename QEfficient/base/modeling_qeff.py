@@ -695,11 +695,12 @@ class QEFFBaseModel(ABC):
         num_devices = compiler_options.pop("num_devices", None)
         mdp_ts_num_devices = compiler_options.pop("mdp_ts_num_devices", 1)
         num_devices = int(mdp_ts_num_devices if num_devices is None else num_devices)
+        if specializations:
+            kwargs["prefill_seq_len"] = specializations[0].get("seq_len")
         if prefill_only:
             kwargs.update(
                 {
                     "prefill_only": prefill_only,
-                    "prefill_seq_len": specializations[0].get("seq_len"),
                     "enable_chunking": enable_chunking,
                     "num_cores": compiler_options.get("aic_num_cores", constants.DEFAULT_AIC_NUM_CORES),
                 }

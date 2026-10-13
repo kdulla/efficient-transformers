@@ -338,6 +338,53 @@ def test_generic_blocked_attention_infers_prefill_only_from_mode(monkeypatch):
 
 
 @pytest.mark.transforms
+def test_generic_blocked_attention_routes_paged_kv_headpar_to_gqa(monkeypatch):
+    class Cache:
+        def read_only_paged_attention(self):
+            pass
+
+    query = torch.ones(1, 2, 1, 4)
+    key = torch.ones(1, 1, 1, 4)
+    value = torch.ones(1, 1, 1, 4)
+    cache = Cache()
+    calls = []
+
+    def paged_gqa_forward(**kwargs):
+        calls.append(kwargs)
+        return kwargs["query"].transpose(1, 2), None
+
+    monkeypatch.setattr(attention_blocking, "paged_gqa_attention_forward", paged_gqa_forward)
+
+    output, weights = attention_blocking.generic_blocked_attention_interface(
+        module=type("Attention", (), {"layer_idx": 0})(),
+        query=query,
+        key=key,
+        value=value,
+        past_key_value=cache,
+        position_ids=torch.tensor([[7]]),
+        block_table=torch.arange(4).view(1, 1, 4),
+        blocking_config=AttentionBlockingConfig(
+            mode=BlockingMode.KV_HEADPAR,
+            num_kv_blocks=2,
+            num_q_blocks=1,
+            head_block_size=1,
+            ctx_len=8,
+            paged_attention=True,
+            attn_dp=1,
+            attn_cp=1,
+            page_block_size=2,
+            num_cores_per_device=1,
+        ),
+    )
+
+    assert torch.equal(output, query.transpose(1, 2))
+    assert weights is None
+    assert len(calls) == 1
+    assert calls[0]["page_block_size"] == 2
+    assert calls[0]["cache_kwargs"]["block_table"].shape == (1, 1, 4)
+
+
+@pytest.mark.transforms
 def test_kv_batch_fold_preserves_optional_gdn_num_head_blocks():
     from QEfficient.blocking.blocking_configurator import build_transformer_blocking_config_for_transform
 
@@ -357,6 +404,38 @@ def test_kv_batch_fold_preserves_optional_gdn_num_head_blocks():
     assert config.mode == BlockingMode.KV_BATCH_FOLD
     assert config.batch_fold is True
     assert config.gdn_num_head_blocks == 8
+
+
+@pytest.mark.transforms
+def test_paged_kv_headpar_preserves_gqa_configuration():
+    from QEfficient.blocking.blocking_configurator import build_transformer_blocking_config_for_transform
+
+    config = build_transformer_blocking_config_for_transform(
+        model_config=object(),
+        ctx_len=1024,
+        seq_len=1,
+        bs=4,
+        qaic_config={
+            "blocking_mode": "kv_headpar_paged",
+            "num_kv_blocks": 16,
+            "attn_dp": 2,
+            "attn_cp": 2,
+            "page_block_size": 64,
+            "gqa_page_block_size": 128,
+            "gqa_num_logical_pages": 24,
+            "gqa_physical_pages": 64,
+        },
+        aic_num_cores=16,
+    )
+
+    assert config.mode == BlockingMode.KV_HEADPAR
+    assert config.paged_attention is True
+    assert config.attn_dp == 2
+    assert config.attn_cp == 2
+    assert config.page_block_size == 64
+    assert config.gqa_page_block_size == 128
+    assert config.gqa_num_logical_pages == 24
+    assert config.gqa_physical_pages == 64
 
 
 # ---------------------------------------------------------------------------

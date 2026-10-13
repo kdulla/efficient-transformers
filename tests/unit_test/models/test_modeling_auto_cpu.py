@@ -566,6 +566,87 @@ class TestQEFFAutoModelForCausalLMCompileValidation:
         assert captured_kwargs["prefill_only"] == compile_kwargs.get("prefill_only")
         assert [spec["_graph_name"] for spec in captured_kwargs["specializations"]] == expected_graph_names
 
+    def test_compile_paged_gqa_defines_symbols_from_current_qaic_config(self, tmp_path, monkeypatch):
+        """Paged-GQA symbols are specialized before export/compile uses qaic_config."""
+        model, _ = make_tiny_llama()
+        qeff = QEFFAutoModelForCausalLM(model)
+        captured_kwargs = {}
+        qaic_config = {
+            "blocking_mode": "kv_headpar_paged",
+            "attn_dp": 2,
+            "attn_cp": 2,
+            "gqa_page_block_size": 4,
+            "gqa_num_logical_pages": 16,
+            "gqa_physical_pages": 32,
+        }
+
+        def fake_compile(**kwargs):
+            captured_kwargs.update(kwargs)
+            return tmp_path / "qpc"
+
+        monkeypatch.setattr(qeff, "_compile", fake_compile)
+        qeff.compile(
+            onnx_path=str(tmp_path / "model.onnx"),
+            prefill_seq_len=1,
+            ctx_len=64,
+            batch_size=4,
+            prefill_only=False,
+            qaic_config=qaic_config,
+        )
+
+        specialization = captured_kwargs["specializations"][0]
+        assert specialization["gqa_batch_local"] == 2
+        assert specialization["gqa_page_size"] == 4
+        assert specialization["gqa_num_pages"] == 16
+        assert specialization["gqa_page_groups"] == 8
+        assert specialization["gqa_physical_pages"] == 32
+
+    def test_compile_paged_gqa_ignores_stale_blocking_kwargs(self, tmp_path, monkeypatch):
+        """A later decode compile uses its qaic_config instead of stale prefill blocking state."""
+        from QEfficient.blocking.attention_blocking import AttentionBlockingConfig, BlockingMode
+
+        model, _ = make_tiny_llama()
+        qeff = QEFFAutoModelForCausalLM(model)
+        qeff.hash_params["blocking_kwargs"] = AttentionBlockingConfig(
+            mode=BlockingMode.KV_HEADPAR,
+            ctx_len=64,
+            paged_attention=True,
+            attn_dp=1,
+            attn_cp=1,
+            gqa_page_block_size=4,
+            gqa_num_logical_pages=16,
+            gqa_physical_pages=64,
+        )
+        captured_kwargs = {}
+
+        def fake_compile(**kwargs):
+            captured_kwargs.update(kwargs)
+            return tmp_path / "qpc"
+
+        monkeypatch.setattr(qeff, "_compile", fake_compile)
+        qeff.compile(
+            onnx_path=str(tmp_path / "model.onnx"),
+            prefill_seq_len=1,
+            ctx_len=64,
+            batch_size=4,
+            prefill_only=False,
+            qaic_config={
+                "blocking_mode": "kv_headpar_paged",
+                "attn_dp": 2,
+                "attn_cp": 4,
+                "gqa_page_block_size": 2,
+                "gqa_num_logical_pages": 32,
+                "gqa_physical_pages": 40,
+            },
+        )
+
+        specialization = captured_kwargs["specializations"][0]
+        assert specialization["gqa_batch_local"] == 2
+        assert specialization["gqa_page_size"] == 2
+        assert specialization["gqa_num_pages"] == 32
+        assert specialization["gqa_page_groups"] == 8
+        assert specialization["gqa_physical_pages"] == 40
+
     def test_compile_prefill_only_true_continuous_batching_requires_kv_cache_batch_size(self):
         """compile raises ValueError when prefill_only=True + continuous_batching=True + no kv_cache_batch_size."""
         model, cfg = make_tiny_gpt2()
@@ -681,6 +762,39 @@ class TestQEFFAutoModelForCausalLMExportPrefillSeqLen:
         qeff._export = fake_export
         assert qeff.export(**export_kwargs) == "/tmp/fake.onnx"
         return captured
+
+    def test_paged_gqa_export_honors_configured_page_capacities(self):
+        from QEfficient.blocking.attention_blocking import AttentionBlockingConfig, BlockingMode
+
+        model, _ = make_tiny_llama()
+        qeff = QEFFAutoModelForCausalLM(model)
+        qeff.hash_params["blocking_kwargs"] = AttentionBlockingConfig(
+            mode=BlockingMode.KV_HEADPAR,
+            num_kv_blocks=2,
+            ctx_len=32,
+            paged_attention=True,
+            attn_dp=2,
+            attn_cp=2,
+            gqa_page_block_size=2,
+            gqa_num_logical_pages=24,
+            gqa_physical_pages=32,
+            num_cores_per_device=1,
+        )
+
+        captured = self._capture_export(
+            qeff,
+            prefill_only=False,
+            prefill_seq_len=1,
+            retain_full_kv=True,
+        )
+
+        assert captured["example_inputs"]["input_ids"].shape[1] == 1
+        assert captured["example_inputs"]["position_ids"].shape[1] == 1
+        block_table = captured["example_inputs"]["block_table"]
+        key_cache = captured["example_inputs"]["past_key_values"][0][0]
+        assert block_table.shape == (2, 1, 12)
+        assert int(block_table.max()) == 23
+        assert key_cache.shape == (32, 8, 2, 32)
 
     def test_chunked_specialized_prefill_uses_default_export_seq_len_without_prefill_seq_len(self):
         """With enable_chunking=True and no prefill_seq_len, export uses ONNX_EXPORT_EXAMPLE_SEQ_LEN."""

@@ -5,6 +5,7 @@
 #
 # -----------------------------------------------------------------------------
 
+import math
 from functools import partial
 from typing import List, Optional, Tuple, Type
 
@@ -432,7 +433,107 @@ class QEffQwen3MoeForCausalLM(Qwen3MoeForCausalLM):
             This method should return the *class object* (not an instance).
             Downstream code can use this to find/build subfunctions for repeated blocks.
         """
+
         return {QEffQwen3MoeDecoderLayer}
+
+    def _get_attention_blocking_config(self) -> Optional[AttentionBlockingConfig]:
+        for layer in getattr(self.model, "layers", ()):
+            blocking_config = getattr(getattr(layer, "self_attn", None), "attn_blocking_config", None)
+            if blocking_config is not None:
+                return blocking_config
+        return None
+
+    def _get_paged_gqa_dimensions(self, batch_size: int, ctx_len: int) -> Optional[dict[str, int]]:
+        qaic_config = self.qaic_config
+        if qaic_config is not None and "kv_headpar_paged" in qaic_config.get("blocking_mode", ""):
+            attn_dp = int(qaic_config.get("attn_dp") or 1)
+            attn_cp = int(qaic_config.get("attn_cp") or 1)
+            page_size = int(qaic_config.get("gqa_page_block_size") or qaic_config.get("page_block_size"))
+            configured_num_pages = qaic_config.get("gqa_num_logical_pages")
+            configured_physical_pages = qaic_config.get("gqa_physical_pages")
+        else:
+            blocking_config = self._get_attention_blocking_config()
+            if blocking_config is None or not blocking_config.paged_attention:
+                return None
+            if blocking_config.mode != BlockingMode.KV_HEADPAR:
+                return None
+            attn_dp = int(blocking_config.attn_dp or 1)
+            attn_cp = int(blocking_config.attn_cp or 1)
+            page_size = int(blocking_config.gqa_page_block_size or blocking_config.page_block_size)
+            configured_num_pages = blocking_config.gqa_num_logical_pages
+            configured_physical_pages = blocking_config.gqa_physical_pages
+
+        if batch_size % attn_dp:
+            raise ValueError(f"Paged GQA batch size {batch_size} must be divisible by attn_dp={attn_dp}.")
+        if ctx_len % (attn_cp * page_size):
+            raise ValueError("Paged GQA ctx_len must be divisible by attn_cp * gqa_page_block_size.")
+
+        minimum_num_pages = math.ceil(ctx_len / page_size)
+        num_pages = minimum_num_pages if configured_num_pages is None else int(configured_num_pages)
+        if num_pages < minimum_num_pages:
+            raise ValueError(
+                f"Paged GQA logical-page capacity must cover ctx_len: {num_pages} pages < {minimum_num_pages}."
+            )
+
+        batch_local = batch_size // attn_dp
+        page_groups = math.ceil(num_pages / attn_cp)
+        required_physical_pages = attn_dp * batch_local * page_groups
+        physical_pages = (
+            required_physical_pages if configured_physical_pages is None else int(configured_physical_pages)
+        )
+        if physical_pages < required_physical_pages:
+            raise ValueError(
+                "Paged GQA physical-page capacity must hold every block-table entry: "
+                f"{physical_pages} pages < {required_physical_pages}."
+            )
+
+        return {
+            "gqa_batch_local": batch_local,
+            "gqa_page_size": page_size,
+            "gqa_num_pages": num_pages,
+            "gqa_page_groups": page_groups,
+            "gqa_physical_pages": physical_pages,
+        }
+
+    def get_pkv_dynamic_axes(
+        self,
+        retain_full_kv: Optional[bool] = False,
+        continuous_batching: Optional[bool] = False,
+    ):
+        blocking_config = self._get_attention_blocking_config()
+        if (
+            blocking_config is not None
+            and blocking_config.paged_attention
+            and blocking_config.mode == BlockingMode.KV_HEADPAR
+        ):
+            return {0: "gqa_physical_pages", 2: "gqa_page_size"}
+        return {
+            0: "full_batch_size" if continuous_batching else "batch_size",
+            2: "ctx_len",
+        }
+
+    def get_specializations(
+        self,
+        batch_size: int,
+        prefill_seq_len: int,
+        ctx_len: int,
+        kv_cache_batch_size: Optional[int] = None,
+        full_batch_size: Optional[int] = None,
+        continuous_batching: bool = False,
+        **kwargs,
+    ):
+        cache_batch_size = kv_cache_batch_size or full_batch_size or batch_size
+        spec_batch_size = full_batch_size if continuous_batching and prefill_seq_len == 1 else batch_size
+        spec = {
+            "batch_size": spec_batch_size,
+            "seq_len": prefill_seq_len,
+            "ctx_len": ctx_len,
+        }
+        paged_gqa_dimensions = self._get_paged_gqa_dimensions(cache_batch_size, ctx_len)
+        if paged_gqa_dimensions is not None:
+            spec.update(paged_gqa_dimensions)
+        decode_spec = dict(spec)
+        return [spec, decode_spec]
 
     def forward(
         self,
