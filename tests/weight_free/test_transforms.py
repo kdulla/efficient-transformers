@@ -235,7 +235,6 @@ def test_checkpoint_root_symlinked_shards(tmp_path, monkeypatch):
 
 
 class TestWeightFreeCheckpointTransforms:
-<<<<<<< HEAD
     def test_prepares_native_deepseek_v4_checkpoint(self, tmp_path):
         src = tmp_path / "src"
         out = tmp_path / "out"
