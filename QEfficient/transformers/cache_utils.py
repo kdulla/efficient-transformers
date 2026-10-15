@@ -17,6 +17,7 @@ from QEfficient.customop import (
     CtxGatherFuncBlockedKVBatch,
     CtxGatherFuncPagedAttention,  # TODO: apply the dynamo related changes coming from latest mainline
     CtxPagedScatterFuncDP,
+    CtxPagedScatterFuncPage,
     CtxScatterFuncPagedAttention,  # TODO: apply the dynamo related changes coming from latest mainline
     ctx_gather,
     ctx_gather_3d,
@@ -602,6 +603,32 @@ class QEffDynamicLayer(CacheLayerMixin):
             .expand(batch_local, dp, cp, num_kv_heads, seq_len, head_dim)
             .reshape(batch_local, rows, seq_len, head_dim)
         )
+        is_export = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing()
+        page_aligned = dp == 1 and cp == 1 and seq_len % page_block_size == 0
+        if page_aligned and not is_export:
+            page_aligned = bool(
+                torch.all(position_ids[:, 0] % page_block_size == 0).item()
+                and torch.all(position_ids[:, 1:] == position_ids[:, :-1] + 1).item()
+            )
+        if page_aligned:
+            num_pages = seq_len // page_block_size
+            logical_pages = (position_ids[:, ::page_block_size] // page_block_size).to(torch.int64)
+            physical_pages = torch.gather(block_table[0].to(torch.int64), 1, logical_pages).to(torch.int32)
+            for batch_idx in range(batch):
+                page_ids = physical_pages[batch_idx].view(num_pages, 1).expand(num_pages, num_kv_heads)
+                key_pages = (
+                    key_states[batch_idx]
+                    .reshape(num_kv_heads, num_pages, page_block_size, head_dim)
+                    .permute(1, 0, 2, 3)
+                )
+                value_pages = (
+                    value_states[batch_idx]
+                    .reshape(num_kv_heads, num_pages, page_block_size, head_dim)
+                    .permute(1, 0, 2, 3)
+                )
+                self.keys = CtxPagedScatterFuncPage.apply(self.keys, page_ids, key_pages)
+                self.values = CtxPagedScatterFuncPage.apply(self.values, page_ids, value_pages)
+            return self.keys, self.values
         self.keys = CtxPagedScatterFuncDP.apply(self.keys, block_id.to(torch.int32), address, key_updates)
         self.values = CtxPagedScatterFuncDP.apply(self.values, block_id.to(torch.int32), address, value_updates)
         return self.keys, self.values

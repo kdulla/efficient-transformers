@@ -84,6 +84,17 @@ def _manual_causal_attention(query, k_full, v_full, query_positions, scaling):
     return torch.matmul(attn_weights, v)
 
 
+def _manual_batched_causal_attention(query, key, value, query_positions, scaling):
+    """Reference causal attention when each batch row owns distinct K/V states."""
+    batch, _heads, query_len, _ = query.shape
+    ctx_len = key.shape[2]
+    attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
+    kv_indices = torch.arange(ctx_len).view(1, 1, 1, -1)
+    causal_mask = kv_indices > query_positions.view(batch, 1, query_len, 1)
+    attn_weights = attn_weights.masked_fill(causal_mask, float("-inf"))
+    return torch.matmul(torch.softmax(attn_weights, dim=-1), value)
+
+
 def _identity_block_table(batch, num_kv_blocks):
     return torch.arange(num_kv_blocks).unsqueeze(0).expand(batch, -1).clone()
 
@@ -132,6 +143,171 @@ def test_paged_gqa_decode_matches_manual_causal_attention():
 
     assert weights is None
     assert torch.allclose(output, expected.transpose(1, 2), atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.cache
+def test_paged_gqa_prefill_matches_manual_causal_attention():
+    num_kv_heads = 1
+    num_query_heads = 4
+    cache = _make_paged_cache(heads=num_kv_heads)
+    module = _DummyModule(num_key_value_groups=num_query_heads // num_kv_heads)
+    query = torch.randn(1, num_query_heads, CTX_LEN, HEAD_DIM)
+    key = torch.randn(1, num_kv_heads, CTX_LEN, HEAD_DIM)
+    value = torch.randn(1, num_kv_heads, CTX_LEN, HEAD_DIM)
+    position_ids = torch.arange(CTX_LEN).unsqueeze(0)
+    block_table = torch.arange(NUM_PHYS_BLOCKS).view(1, 1, NUM_PHYS_BLOCKS)
+
+    output, weights = paged_gqa_attention_forward(
+        module=module,
+        query=query,
+        key=key,
+        value=value,
+        attention_mask=None,
+        scaling=SCALING,
+        num_kv_blocks=2,
+        cache_kwargs={"position_ids": position_ids, "block_table": block_table},
+        layer_idx=0,
+        past_key_value=cache,
+        ctx_len=CTX_LEN,
+        attn_dp=1,
+        attn_cp=1,
+        page_block_size=BLOCK_SIZE,
+        num_cores_per_device=2,
+        num_q_blocks=2,
+        q_blocks_per_outer=1,
+        head_block_size=1,
+    )
+
+    key_full = repeat_kv(key, module.num_key_value_groups).squeeze(0)
+    value_full = repeat_kv(value, module.num_key_value_groups).squeeze(0)
+    expected = _manual_causal_attention(query, key_full, value_full, position_ids, SCALING)
+
+    assert weights is None
+    assert torch.allclose(output, expected.transpose(1, 2), atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.accuracy
+@pytest.mark.cache
+def test_paged_gqa_batch_two_dp2_cp2_prefill_repack_decode_accuracy():
+    """Match the qwen3_moe_paged_gqa example's prefill-to-decode topology at CPU scale."""
+    from examples.text_generation.qwen3_moe_paged_gqa import _block_table, _repack_paged_gqa_cache
+
+    batch = 2
+    attn_dp = 2
+    attn_cp = 2
+    num_query_heads = 8
+    num_kv_heads = 1
+    num_cores = 4
+    num_kv_blocks = 4
+    page_block_size = 2
+    prefill_seq_len = 8
+    ctx_len = 64
+    num_logical_pages = ctx_len // page_block_size
+    prefill_physical_pages = batch * num_logical_pages
+    decode_physical_pages = batch * (num_logical_pages // attn_cp)
+    generator = torch.Generator().manual_seed(42)
+    module = _DummyModule(num_key_value_groups=num_query_heads // num_kv_heads)
+
+    prefill_layer = QEffDynamicLayer.from_tensors(
+        torch.zeros(prefill_physical_pages, num_kv_heads, page_block_size, HEAD_DIM),
+        torch.zeros(prefill_physical_pages, num_kv_heads, page_block_size, HEAD_DIM),
+    )
+    prefill_cache = QEffDynamicCache()
+    prefill_cache.layers.append(prefill_layer)
+    prefill_table_np = _block_table(1, batch, num_logical_pages, 1, prefill_physical_pages)
+    prefill_table = torch.from_numpy(prefill_table_np)
+    prefill_positions = torch.arange(prefill_seq_len).unsqueeze(0).expand(batch, -1)
+    prefill_query = torch.randn(batch, num_query_heads, prefill_seq_len, HEAD_DIM, generator=generator)
+    prefill_key = torch.randn(batch, num_kv_heads, prefill_seq_len, HEAD_DIM, generator=generator)
+    prefill_value = torch.randn(batch, num_kv_heads, prefill_seq_len, HEAD_DIM, generator=generator)
+
+    prefill_output, prefill_weights = paged_gqa_attention_forward(
+        module=module,
+        query=prefill_query,
+        key=prefill_key,
+        value=prefill_value,
+        attention_mask=None,
+        scaling=SCALING,
+        num_kv_blocks=num_kv_blocks,
+        cache_kwargs={"position_ids": prefill_positions, "block_table": prefill_table},
+        layer_idx=0,
+        past_key_value=prefill_cache,
+        ctx_len=ctx_len,
+        skip_kv=True,
+        attn_dp=1,
+        attn_cp=1,
+        page_block_size=page_block_size,
+        num_cores_per_device=num_cores,
+        num_q_blocks=2,
+        q_blocks_per_outer=1,
+        head_block_size=1,
+    )
+
+    expected_prefill = _manual_batched_causal_attention(
+        prefill_query,
+        repeat_kv(prefill_key, module.num_key_value_groups),
+        repeat_kv(prefill_value, module.num_key_value_groups),
+        prefill_positions,
+        SCALING,
+    )
+    assert prefill_weights is None
+    assert torch.allclose(prefill_output, expected_prefill.transpose(1, 2), atol=1e-4, rtol=1e-4)
+
+    decode_table_np = _block_table(attn_dp, batch, num_logical_pages, attn_cp, decode_physical_pages)
+    decode_cache_shape = (decode_physical_pages, attn_dp * attn_cp * num_kv_heads, page_block_size, HEAD_DIM)
+    decode_key_cache = _repack_paged_gqa_cache(
+        prefill_cache.layers[0].keys.numpy(),
+        prefill_table_np,
+        decode_table_np,
+        decode_cache_shape,
+        attn_dp,
+        attn_cp,
+    )
+    decode_value_cache = _repack_paged_gqa_cache(
+        prefill_cache.layers[0].values.numpy(),
+        prefill_table_np,
+        decode_table_np,
+        decode_cache_shape,
+        attn_dp,
+        attn_cp,
+    )
+    decode_cache = QEffDynamicCache()
+    decode_cache.layers.append(
+        QEffDynamicLayer.from_tensors(torch.from_numpy(decode_key_cache), torch.from_numpy(decode_value_cache))
+    )
+    decode_query = torch.randn(batch, num_query_heads, 1, HEAD_DIM, generator=generator)
+    decode_key = torch.randn(batch, num_kv_heads, 1, HEAD_DIM, generator=generator)
+    decode_value = torch.randn(batch, num_kv_heads, 1, HEAD_DIM, generator=generator)
+    decode_positions = torch.full((batch, 1), prefill_seq_len)
+
+    decode_output, decode_weights = paged_gqa_attention_forward(
+        module=module,
+        query=decode_query,
+        key=decode_key,
+        value=decode_value,
+        attention_mask=None,
+        scaling=SCALING,
+        num_kv_blocks=num_kv_blocks,
+        cache_kwargs={"position_ids": decode_positions, "block_table": torch.from_numpy(decode_table_np)},
+        layer_idx=0,
+        past_key_value=decode_cache,
+        ctx_len=ctx_len,
+        skip_kv=True,
+        attn_dp=attn_dp,
+        attn_cp=attn_cp,
+        page_block_size=page_block_size,
+        num_cores_per_device=num_cores,
+    )
+
+    expected_decode = _manual_batched_causal_attention(
+        decode_query,
+        repeat_kv(torch.cat((prefill_key, decode_key), dim=2), module.num_key_value_groups),
+        repeat_kv(torch.cat((prefill_value, decode_value), dim=2), module.num_key_value_groups),
+        decode_positions,
+        SCALING,
+    )
+    assert decode_weights is None
+    assert torch.allclose(decode_output, expected_decode.transpose(1, 2), atol=1e-4, rtol=1e-4)
 
 
 # ---------------------------------------------------------------------------

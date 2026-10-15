@@ -567,6 +567,54 @@ class CtxPagedScatterFuncDP(torch.autograd.Function):
         return g.onnxscript_op(CtxPagedScatterDP, data, block_id, addr, updates).setTypeAs(data)
 
 
+@qeff_custom_op("com.qti.aisw.onnx", 1)
+def CtxPagedScatterPage(
+    data: onnxscript.FLOAT, block_id: onnxscript.INT32, updates: onnxscript.FLOAT
+) -> onnxscript.FLOAT:
+    """Scatter complete pages into a physical page pool.
+
+    ``data`` is ``[physical_pages, heads, page_size, dim]``;
+    ``block_id`` is ``[pages, heads]`` and ``updates`` is
+    ``[pages, heads, page_size, dim]``.
+    """
+    update_shape = ops.Shape(updates)
+    num_pages = ops.Gather(update_shape, [0])
+    num_heads = ops.Gather(update_shape, [1])
+    zero = ops.Constant(value_ints=[0])
+    one = ops.Constant(value_ints=[1])
+    head_idx = ops.Expand(
+        ops.Unsqueeze(ops.Range(zero, num_heads, one), [0]),
+        ops.Concat(num_pages, num_heads, axis=0),
+    )
+    indices = ops.Concat(
+        ops.Unsqueeze(ops.Cast(block_id, to=7), [-1]),
+        ops.Unsqueeze(ops.Cast(head_idx, to=7), [-1]),
+        axis=2,
+    )
+    return ops.ScatterND(data, indices, updates)
+
+
+class CtxPagedScatterFuncPage(torch.autograd.Function):
+    """Scatter complete pages using one physical-page ID per KV head."""
+
+    @staticmethod
+    def forward(data: torch.Tensor, block_id: torch.Tensor, updates: torch.Tensor) -> torch.Tensor:
+        out = data.clone()
+        valid = block_id != torch.iinfo(torch.int32).max
+        page_idx = block_id.long()
+        heads = torch.arange(data.shape[1], device=data.device).view(1, -1).expand_as(block_id)
+        out[page_idx[valid], heads[valid]] = updates[valid]
+        return out
+
+    @staticmethod
+    def setup_context(ctx, inputs, outputs):
+        pass
+
+    @staticmethod
+    def symbolic(g: torch.Graph, data: torch.Value, block_id: torch.Value, updates: torch.Value) -> torch.Value:
+        return g.onnxscript_op(CtxPagedScatterPage, data, block_id, updates).setTypeAs(data)
+
+
 @onnxscript.script(onnxscript.values.Opset("com.qti.aisw.onnx", 1))
 def CtxGatherPagedKVDP(data: onnxscript.FLOAT, block_ids: onnxscript.INT32) -> onnxscript.FLOAT:
     # data: [physical_blocks, rows, page_size, D]
