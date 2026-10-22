@@ -190,8 +190,9 @@ def _weight_free_external_data_root(weight_spec_path: Optional[Union[str, Path]]
         return None
 
     spec = load_weight_spec(weight_spec_path)
-    if spec.external_data_root:
-        return Path(spec.external_data_root).expanduser()
+    external_data_root = getattr(spec, "external_data_root", None)
+    if external_data_root:
+        return Path(external_data_root).expanduser()
 
     model_id_path = Path(spec.model_id).expanduser()
     if model_id_path.exists():
@@ -274,6 +275,35 @@ def _restore_retained_state_output_names(model: onnx.ModelProto, output_names: L
             continue
         if current_name.isdigit() or "_InternalRetainedState" in current_name or "_RetainedState" in current_name:
             _rename_graph_value(model.graph, current_name, expected_name)
+
+
+def _normalize_minimax_retained_state_inputs(model: onnx.ModelProto) -> None:
+    """Pair MiniMax retained-state outputs with plain cache graph inputs."""
+    retained_state_suffixes = ("_InternalRetainedState", "_RetainedState")
+    input_names = {value.name for value in model.graph.input}
+    for value in model.graph.input:
+        suffix = next((suffix for suffix in retained_state_suffixes if value.name.endswith(suffix)), None)
+        if suffix is None:
+            continue
+        old_name = value.name
+        new_name = old_name[: -len(suffix)]
+        if new_name in input_names:
+            continue
+        value.name = new_name
+        for node in model.graph.node:
+            node.input[:] = [new_name if name == old_name else name for name in node.input]
+        input_names.remove(old_name)
+        input_names.add(new_name)
+
+    node_outputs = {name for node in model.graph.node for name in node.output}
+    for output in model.graph.output:
+        if not output.name.endswith(("_RetainedState", "_InternalRetainedState")) or output.name in node_outputs:
+            continue
+        suffix = "_InternalRetainedState" if output.name.endswith("_InternalRetainedState") else "_RetainedState"
+        input_name = output.name[: -len(suffix)]
+        if input_name in input_names:
+            model.graph.node.append(onnx.helper.make_node("Identity", [input_name], [output.name]))
+            node_outputs.add(output.name)
 
 
 def _restore_output_names_exact(model: onnx.ModelProto, output_names: List[str]) -> None:
@@ -446,6 +476,11 @@ class QEFFBaseModel(ABC):
         # Flag for checking if weights are offloaded
         self._is_weights_offloaded: bool = False
         self._weight_free: bool = kwargs.get("weight_free", False)
+        self._use_original_checkpoint: bool = kwargs.get("use_original_checkpoint", False)
+        if self._use_original_checkpoint and not self._weight_free:
+            raise ValueError("use_original_checkpoint=True requires weight_free=True")
+        for module in self.model.modules():
+            module._qeff_use_original_checkpoint = self._use_original_checkpoint
         # Preserve an explicit caller dtype before config normalization can fall back to stale config fields.
         self._requested_torch_dtype = kwargs.get("torch_dtype", kwargs.get("dtype", None))
         # Flag for checking if model has been transformed yet
@@ -761,6 +796,13 @@ class QEFFBaseModel(ABC):
                     else:
                         indexer_layers = range(len(example_inputs["indexer_key_cache"]))
                     input_names.extend(f"indexer_key.{i}" for i in indexer_layers)
+                elif param == "index_keys" and getattr(self.model.config, "model_type", None) == "minimax_m3_vl":
+                    if hasattr(self.model, "get_onnx_index_key_names"):
+                        input_names.extend(self.model.get_onnx_index_key_names())
+                    elif isinstance(example_inputs["index_keys"], (list, tuple)):
+                        input_names.extend(f"index_key.{i}" for i in range(len(example_inputs["index_keys"])))
+                    else:
+                        input_names.append(param)
                 else:
                     input_names.append(param)
 
@@ -850,6 +892,9 @@ class QEFFBaseModel(ABC):
 
             onnx_transforms = OnnxTransformPipeline(transforms=active_transforms)
             model, transformed = onnx_transforms.apply(model, **transform_kwargs)
+
+            if getattr(self.model.config, "model_type", None) in {"minimax_m3_vl", "minimax_m3_vl_text"}:
+                _normalize_minimax_retained_state_inputs(model)
 
             # Dynamo records module paths in node metadata but uses generic node
             # names. The compiler and MDP tooling consume node names, so expose
@@ -1145,6 +1190,13 @@ class QEFFBaseModel(ABC):
                     else:
                         indexer_layers = range(len(example_inputs["indexer_key_cache"]))
                     input_names.extend(f"indexer_key.{i}" for i in indexer_layers)
+                elif param == "index_keys" and getattr(self.model.config, "model_type", None) == "minimax_m3_vl":
+                    if hasattr(self.model, "get_onnx_index_key_names"):
+                        input_names.extend(self.model.get_onnx_index_key_names())
+                    elif isinstance(example_inputs["index_keys"], (list, tuple)):
+                        input_names.extend(f"index_key.{i}" for i in range(len(example_inputs["index_keys"])))
+                    else:
+                        input_names.append(param)
                 else:
                     input_names.append(param)
         dynamic_axes = {k: v for k, v in dynamic_axes.items() if k in input_names}

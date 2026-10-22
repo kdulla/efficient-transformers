@@ -69,15 +69,32 @@ def reorder_inputs_by_signature(model, example_inputs, dynamic_shapes=None):
     """
     sig_keys = list(inspect.signature(model.forward).parameters.keys())
     sig_key_set = set(sig_keys)
-    ordered_inputs, ordered_shapes = {}, {}
+    ordered_inputs = {}
     for k in sig_keys:
         if k in example_inputs:
             ordered_inputs[k] = example_inputs[k]
-        if dynamic_shapes is not None and k in dynamic_shapes:
-            ordered_shapes[k] = dynamic_shapes[k]
     reordered_inputs = {**ordered_inputs, **{k: v for k, v in example_inputs.items() if k not in sig_key_set}}
     if dynamic_shapes is not None:
-        reordered_shapes = {**ordered_shapes, **{k: v for k, v in dynamic_shapes.items() if k not in sig_key_set}}
+        # torch.export requires dynamic_shapes keys to be actual forward
+        # argument names. Flattened ONNX cache names such as ``index_key.3``
+        # are represented by the nested ``index_keys`` pytree entry instead.
+        reordered_shapes = {k: dynamic_shapes.get(k, {}) for k in reordered_inputs}
+        if getattr(getattr(model, "config", None), "model_type", None) in {
+            "minimax_m3_vl",
+            "minimax_m3_vl_text",
+        }:
+            def _concretize(spec, value):
+                if torch.is_tensor(value) and isinstance(spec, dict):
+                    return {axis: int(value.shape[axis]) for axis in spec}
+                if isinstance(spec, (list, tuple)) and isinstance(value, (list, tuple)):
+                    return type(spec)(_concretize(s, v) for s, v in zip(spec, value))
+                if isinstance(spec, dict) and isinstance(value, dict):
+                    return {key: _concretize(item, value.get(key)) for key, item in spec.items()}
+                return spec
+
+            reordered_shapes = {
+                key: _concretize(spec, reordered_inputs[key]) for key, spec in reordered_shapes.items()
+            }
         return reordered_inputs, reordered_shapes
     return reordered_inputs, None
 
@@ -131,9 +148,11 @@ def convert_dynamic_axes_to_dynamic_shapes(
         torch.export dynamic_shapes dict with Dim objects, suitable for
         torch.onnx.export(dynamic_shapes=...).
     """
-    max_seq_len = getattr(model_config, "max_position_embeddings", 1024)
+    max_seq_len = getattr(model_config, "max_position_embeddings", None)
+    if max_seq_len is None:
+        max_seq_len = getattr(getattr(model_config, "text_config", None), "max_position_embeddings", 1024)
     model_type = getattr(model_config, "model_type", None)
-    batch_min = 1 if model_type == "gpt_oss" else 2
+    batch_min = 1 if model_type in {"gpt_oss", "minimax_m3_vl", "minimax_m3_vl_text"} else 2
 
     dim_registry: Dict[str, Any] = {}
 
@@ -145,7 +164,7 @@ def convert_dynamic_axes_to_dynamic_shapes(
                 # CB pool capacity; different min prevents torch.export collapsing it with batch_size.
                 dim_registry[dim_name] = Dim("full_batch_size", min=batch_min + 1, max=DYNAMO_DIM_MAX_BATCH_SIZE)
             elif "seq_len" in dim_name:
-                seq_min = 1 if model_type in {"qwen4_exp", "qwen4_exp_text"} else 2
+                seq_min = 1 if model_type in {"qwen4_exp", "qwen4_exp_text", "minimax_m3_vl", "minimax_m3_vl_text"} else 2
                 dim_registry[dim_name] = Dim("seq_len", min=seq_min, max=max_seq_len)
             elif "comp_ctx_lengths" in dim_name:
                 dim_registry[dim_name] = Dim("comp_ctx_lengths", min=DYNAMO_DIM_MIN_COMP_CTX_LENGTHS, max=max_seq_len)
@@ -158,6 +177,8 @@ def convert_dynamic_axes_to_dynamic_shapes(
             elif "pooled_ctx_len" in dim_name:
                 dim_registry[dim_name] = Dim("pooled_ctx_len", min=2, max=max_seq_len)
             elif dim_name.startswith("compressed_ctx_len_"):
+                dim_registry[dim_name] = Dim(dim_name, min=1, max=max_seq_len)
+            elif model_type in {"minimax_m3_vl", "minimax_m3_vl_text"} and "ctx_len" in dim_name:
                 dim_registry[dim_name] = Dim(dim_name, min=1, max=max_seq_len)
             elif "ctx_len" in dim_name:
                 dim_registry[dim_name] = Dim("ctx_len", min=2, max=max_seq_len)
@@ -182,6 +203,11 @@ def convert_dynamic_axes_to_dynamic_shapes(
     deepseek_v4_past_states: Dict[int, list[Any]] = {}
 
     for input_name, axes_map in dynamic_axes.items():
+        # Dynamic axes metadata also contains retained-state outputs. They use
+        # names such as ``past_key.0_RetainedState`` but are not inputs to the
+        # torch.export pytree, so do not parse their suffix as a layer index.
+        if input_name.endswith(("_RetainedState", "_InternalRetainedState")):
+            continue
         # Folded GLM cache dimensions are derived from fixed DP/CP topology
         # values. Keep their distinct names in ONNX dynamic_axes metadata, but
         # leave them static for torch.export, which cannot express B/DP or T/CP
@@ -206,7 +232,7 @@ def convert_dynamic_axes_to_dynamic_shapes(
             compressed_kv_layers[int(input_name.split(".")[1])] = resolved
         elif input_name.startswith("k_pe."):
             k_pe_layers[int(input_name.split(".")[1])] = resolved
-        elif input_name.startswith("indexer_key."):
+        elif input_name.startswith(("indexer_key.", "index_key.")):
             indexer_key_layers[int(input_name.split(".")[1])] = resolved
         else:
             dynamic_shapes[input_name] = resolved
@@ -259,7 +285,8 @@ def convert_dynamic_axes_to_dynamic_shapes(
         ]
 
     if indexer_key_layers:
-        dynamic_shapes["indexer_key_cache"] = [
+        index_key_name = "index_keys" if model_type == "minimax_m3_vl" else "indexer_key_cache"
+        dynamic_shapes[index_key_name] = [
             resolved for _, resolved in sorted(indexer_key_layers.items(), key=lambda item: item[0])
         ]
 

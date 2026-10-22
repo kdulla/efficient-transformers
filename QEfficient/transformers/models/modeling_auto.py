@@ -43,6 +43,7 @@ from QEfficient.exporter.weight_free.checkpoint_transforms import (
     GlmMoeDsaReducedCheckpointTransform,
     GptOssMxfp4ExpertDequantSplitCheckpointTransform,
     GraniteMoeFusedExpertSplitCheckpointTransform,
+    MiniMaxM3DenseGateUpCheckpointTransform,
     MoEExpertStackingCheckpointTransform,
     MoEFusedExpertSplitCheckpointTransform,
 )
@@ -180,6 +181,11 @@ def _disable_unsupported_weight_free(kwargs: dict, qeff_auto_class_name: str) ->
         "weight_free=True is only supported for QEFFAutoModelForCausalLM, QEffAutoModel; disabling it for %s.",
         qeff_auto_class_name,
     )
+
+
+def _is_minimax_m3_vl(model_or_config) -> bool:
+    config = getattr(model_or_config, "config", model_or_config)
+    return getattr(config, "model_type", None) == "minimax_m3_vl"
 
 
 def _resolve_torch_dtype(kwargs: dict) -> None:
@@ -1281,7 +1287,8 @@ class QEffVisionEncoderForTextImageToTextModel(QEFFBaseModel):
             Additional keyword arguments passed to the base class constructor.
         """
         _configure_proxy_for_model(self, kwargs.pop("enable_proxy", False))
-        _disable_unsupported_weight_free(kwargs, self.__class__.__name__)
+        if not _is_minimax_m3_vl(model):
+            _disable_unsupported_weight_free(kwargs, self.__class__.__name__)
         super().__init__(model, **kwargs)
         self.model = model.get_qeff_vision_encoder()
         self.hash_params["qeff_auto_class"] = self.__class__.__name__
@@ -1310,6 +1317,7 @@ class QEffVisionEncoderForTextImageToTextModel(QEFFBaseModel):
         str
             Path to the generated ONNX graph file for the vision encoder.
         """
+        dynamo = kwargs.get("dynamo", False) or self._weight_free
         return self._export(
             inputs,
             output_names=output_names,
@@ -1317,6 +1325,7 @@ class QEffVisionEncoderForTextImageToTextModel(QEFFBaseModel):
             export_dir=export_dir,
             offload_pt_weights=offload_pt_weights,
             use_onnx_subfunctions=kwargs.get("use_onnx_subfunctions", False),
+            dynamo=dynamo,
         )
 
     def compile(
@@ -1423,10 +1432,25 @@ class QEffCausalLMForTextImageToTextModel(QEFFBaseModel):
             Additional keyword arguments passed to the base class constructor.
         """
         _configure_proxy_for_model(self, kwargs.pop("enable_proxy", False))
-        _disable_unsupported_weight_free(kwargs, self.__class__.__name__)
+        if not _is_minimax_m3_vl(model):
+            _disable_unsupported_weight_free(kwargs, self.__class__.__name__)
         super().__init__(model, **kwargs)
         self.model = model.get_qeff_language_decoder()
         self.qaic_config = qaic_config
+        if _is_minimax_m3_vl(model):
+            self._onnx_transforms = list(self._onnx_transforms)
+            self._checkpoint_transforms = [
+                GptOssMxfp4ExpertDequantSplitCheckpointTransform,
+                MoEExpertStackingCheckpointTransform,
+                MoEFusedExpertSplitCheckpointTransform,
+                MiniMaxM3DenseGateUpCheckpointTransform,
+                DtypeConversionCheckpointTransform,
+            ]
+            get_onnx_transforms = getattr(self.model, "get_onnx_transforms", None)
+            if callable(get_onnx_transforms):
+                for transform in get_onnx_transforms():
+                    if transform not in self._onnx_transforms:
+                        self._onnx_transforms.append(transform)
         self.hash_params["qeff_auto_class"] = self.__class__.__name__
         self.continuous_batching = False
         if qaic_config and (mla_absorption := qaic_config.get("mla_absorption", None)):
@@ -1501,6 +1525,21 @@ class QEffCausalLMForTextImageToTextModel(QEFFBaseModel):
             self.__update_prefill_transform(False, retain_full_kv=kwargs.get("retain_full_kv", False))
 
         qaic_config = kwargs.pop("qaic_config", getattr(self.model, "qaic_config", None))
+        onnx_transform_kwargs = dict(kwargs.pop("onnx_transform_kwargs", None) or {})
+        get_onnx_transform_kwargs = getattr(self.model, "get_onnx_transform_kwargs", None)
+        if callable(get_onnx_transform_kwargs):
+            model_transform_kwargs = get_onnx_transform_kwargs(inputs=inputs, prefill_only=prefill_only)
+            conflicting_keys = {
+                key
+                for key, value in model_transform_kwargs.items()
+                if key in onnx_transform_kwargs and onnx_transform_kwargs[key] != value
+            }
+            if conflicting_keys:
+                raise ValueError(
+                    "Model ONNX transform arguments conflict with caller-provided values for "
+                    f"{sorted(conflicting_keys)}."
+                )
+            onnx_transform_kwargs.update(model_transform_kwargs)
 
         if QEfficient.base.modeling_qeff.QEFFBaseModel._layerwise_active:
             return self._export_layerwise(
@@ -1517,6 +1556,7 @@ class QEffCausalLMForTextImageToTextModel(QEFFBaseModel):
                 num_cores=kwargs.get("num_cores", constants.DEFAULT_AIC_NUM_CORES),
                 qaic_config=qaic_config,
                 prefill_seq_len=prefill_seq_len,
+                onnx_transform_kwargs=onnx_transform_kwargs,
             )
         else:
             return self._export(
@@ -1526,6 +1566,8 @@ class QEffCausalLMForTextImageToTextModel(QEFFBaseModel):
                 export_dir=export_dir,
                 offload_pt_weights=offload_pt_weights,
                 use_onnx_subfunctions=kwargs.get("use_onnx_subfunctions", False),
+                dynamo=kwargs.get("dynamo", False) or self._weight_free,
+                onnx_transform_kwargs=onnx_transform_kwargs,
             )
 
     def compile(
@@ -1626,7 +1668,8 @@ class _QEffAutoModelForImageTextToTextDualQPC:
         **kwargs :
             Additional keyword arguments.
         """
-        _disable_unsupported_weight_free(kwargs, self.__class__.__name__)
+        if not _is_minimax_m3_vl(model):
+            _disable_unsupported_weight_free(kwargs, self.__class__.__name__)
         if kwargs.pop("full_batch_size", None):
             continuous_batching = True
             warnings.warn(
@@ -1635,6 +1678,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
         self.model = model
         self.config = model.config
         self._pretrained_model_name_or_path = kwargs.get("pretrained_model_name_or_path", None)
+        self._weight_free = kwargs.get("weight_free", False)
 
         self.vision_model = QEffVisionEncoderForTextImageToTextModel(model, **kwargs)
         self.lang_model = QEffCausalLMForTextImageToTextModel(model, qaic_config=qaic_config, **kwargs)
@@ -1678,7 +1722,8 @@ class _QEffAutoModelForImageTextToTextDualQPC:
         _QEffAutoModelForImageTextToTextDualQPC
             An instance initialized with the pretrained weights.
         """
-        _disable_unsupported_weight_free(kwargs, cls.__name__)
+        if not _is_minimax_m3_vl(kwargs.get("config")):
+            _disable_unsupported_weight_free(kwargs, cls.__name__)
         enable_proxy = kwargs.pop("enable_proxy", False)
 
         if kwargs.get("attn_implementation", None) not in {None, "eager"}:
@@ -1749,6 +1794,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
         skip_vision: bool | None = False,
         skip_lang: bool | None = False,
         prefill_seq_len: int | None = None,
+        ctx_len: int | None = None,
         prefill_only: bool = False,
         enable_chunking: bool = False,
         num_cores: int = constants.DEFAULT_AIC_NUM_CORES,
@@ -1799,6 +1845,11 @@ class _QEffAutoModelForImageTextToTextDualQPC:
         )
         qaic_config = kwargs.get("qaic_config", getattr(self.lang_model.model, "qaic_config", None))
         if self.model.config.model_type == "minimax_m3_vl" and qaic_config:
+            # MiniMax derives distributed cache layouts in get_dummy_inputs()
+            # from the model-local QAIC configuration. Keep compile-time
+            # overrides synchronized before constructing those inputs.
+            self.model.qaic_config = qaic_config
+            self.lang_model.model.qaic_config = qaic_config
             dp_factors = [
                 int(qaic_config.get(key, 1) or 1)
                 for key in ("msa_indexer_dp", "msa_attn_dp", "attn_dp")
@@ -1816,6 +1867,10 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             else:
                 self.__update_prefill_transform(False, retain_full_kv=kwargs.get("retain_full_kv", False))
         onnx_kwargs = {"prefill_seq_len": seq_len, "batch_size": bs}
+        if self.model.config.model_type == "minimax_m3_vl":
+            ctx_len = constants.ONNX_EXPORT_CTX_LEN if ctx_len is None else int(ctx_len)
+            onnx_kwargs["ctx_len"] = ctx_len
+            onnx_kwargs["past_seq_len"] = ctx_len if seq_len == 1 else seq_len
         if "ctx_len" in kwargs:
             onnx_kwargs["ctx_len"] = kwargs["ctx_len"]
         dynamic_axes_kwargs = {
@@ -1876,6 +1931,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
                 export_dir=export_dir,
                 offload_pt_weights=False,
                 use_onnx_subfunctions=use_onnx_subfunctions,
+                dynamo=self._weight_free,
             )
 
         # TODO: remove the current pt weight offload capability once CustomLoader is in place
@@ -1900,6 +1956,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
                 qaic_config=qaic_config,
                 _layerwise_cache_probe=layerwise_cache_probe,
                 kv_cache_prefix=kv_cache_prefix,
+                dynamo=self._weight_free,
             )
         return self.onnx_path
 
@@ -2147,6 +2204,11 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             If `full_batch_size`, `kv_cache_batch_size`, or `num_speculative_tokens` are not None.
             If both `skip_lang` and `skip_vision` are True.
         """
+        if self.model.config.model_type == "minimax_m3_vl" and qaic_config is not None:
+            # MiniMax get_specializations() and get_dummy_inputs() read the
+            # model-local QAIC configuration to select DP/CP cache layouts.
+            self.model.qaic_config = qaic_config
+            self.lang_model.model.qaic_config = qaic_config
         if artifacts:
             compiler_options["artifacts"] = True
         if skip_lang and skip_vision:
@@ -3613,7 +3675,8 @@ class QEFFAutoModelForImageTextToText:
         Union[_QEffAutoModelForImageTextToTextDualQPC, _QEFFAutoModelForImageTextToTextSingleQPC]
             The wrapped model instance, configured for either dual or single QPC.
         """
-        _disable_unsupported_weight_free(kwargs, self.__name__)
+        if not _is_minimax_m3_vl(model):
+            _disable_unsupported_weight_free(kwargs, self.__name__)
         if kv_offload:
             return _QEffAutoModelForImageTextToTextDualQPC(
                 model, continuous_batching, qaic_config=qaic_config, **kwargs
@@ -3631,6 +3694,7 @@ class QEFFAutoModelForImageTextToText:
         continuous_batching: bool = False,
         qaic_config: dict | None = None,
         layerwise: bool = False,
+        weight_free: bool = False,
         **kwargs,
     ):
         """
@@ -3662,7 +3726,13 @@ class QEFFAutoModelForImageTextToText:
         NotImplementedError
             If `continuous_batching` is provided as True.
         """
-        _disable_unsupported_weight_free(kwargs, cls.__name__)
+        minimax_weight_free = weight_free and _is_minimax_m3_vl(kwargs.get("config"))
+        if weight_free and not minimax_weight_free:
+            logger.warning("weight_free=True is only supported for MiniMax-M3 VLM; disabling it.")
+        if layerwise and minimax_weight_free:
+            raise ValueError(
+                "`layerwise=True` and `weight_free=True` are mutually exclusive; weight_free replaces layerwise mode."
+            )
         enable_proxy = kwargs.pop("enable_proxy", False)
 
         # TODO: add a check to see if kv_offload is allowed for given model by loading the config and checking architecture or type of config here.
@@ -3693,6 +3763,9 @@ class QEFFAutoModelForImageTextToText:
             # internally via the layer-wise driver, so the outer instance is
             # only used as a config holder.
             model = _build_meta_model(cls._hf_auto_class, pretrained_model_name_or_path, kwargs)
+        elif minimax_weight_free:
+            validate_dynamo_export_requirements("weight_free=True")
+            model = _build_meta_model(cls._hf_auto_class, pretrained_model_name_or_path, kwargs)
         else:
             model = cls._hf_auto_class.from_pretrained(pretrained_model_name_or_path, **kwargs)
 
@@ -3704,6 +3777,7 @@ class QEFFAutoModelForImageTextToText:
             continuous_batching=continuous_batching,
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             qaic_config=qaic_config,
+            weight_free=minimax_weight_free,
             **kwargs,
         )
         # Mark the wrapper so its compile() can default ``layerwise=True`` if

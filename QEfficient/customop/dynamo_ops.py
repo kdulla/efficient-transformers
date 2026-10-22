@@ -194,7 +194,7 @@ def ctx_gather_blocked_kv_dp_op(data: torch.Tensor, ctx_indices: torch.Tensor) -
 
 @ctx_gather_blocked_kv_dp_op.register_fake
 def _(data, ctx_indices):
-    return data.new_empty((*ctx_indices.shape, data.shape[-1]))
+    return data.new_empty((*data.shape[:2], ctx_indices.shape[-1], *data.shape[3:]))
 
 
 @torch.library.custom_op("qefficient::ctx_gather_paged_kv_dp", mutates_args=())
