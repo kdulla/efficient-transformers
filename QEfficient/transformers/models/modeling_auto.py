@@ -1841,7 +1841,9 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             )
         bs: int = constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE
         seq_len: int = int(
-            prefill_seq_len if prefill_seq_len is not None else kwargs.get("prefill_seq_len", constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN)
+            prefill_seq_len
+            if prefill_seq_len is not None
+            else kwargs.get("prefill_seq_len", constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN)
         )
         qaic_config = kwargs.get("qaic_config", getattr(self.lang_model.model, "qaic_config", None))
         if self.model.config.model_type == "minimax_m3_vl" and qaic_config:
@@ -1850,10 +1852,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             # overrides synchronized before constructing those inputs.
             self.model.qaic_config = qaic_config
             self.lang_model.model.qaic_config = qaic_config
-            dp_factors = [
-                int(qaic_config.get(key, 1) or 1)
-                for key in ("msa_indexer_dp", "msa_attn_dp", "attn_dp")
-            ]
+            dp_factors = [int(qaic_config.get(key, 1) or 1) for key in ("msa_indexer_dp", "msa_attn_dp", "attn_dp")]
             bs = max(bs, max(dp_factors))
         gdn_export_kwargs = _get_gdn_full_state_update_kwargs(
             self.model,
@@ -5213,7 +5212,9 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
 
         weight_free = getattr(self, "_weight_free", False)
         weightfree_decode_only = weight_free and self.model.config.model_type == "qwen4_exp_text"
-        if weight_free and (prefill_only is True or (prefill_seq_len == 1 and not weightfree_decode_only)):
+        if self.model.config.model_type == "qwen4_exp_text" and (
+            weight_free and (prefill_only is True or (prefill_seq_len == 1 and not weightfree_decode_only))
+        ):
             raise NotImplementedError(
                 "weight_free=True is not supported with disaggregated compile (prefill_only=True or prefill_seq_len=1)."
             )
