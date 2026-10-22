@@ -739,7 +739,7 @@ class QEffQwen3_5MoeGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
             sub = torch.stack(solved_rows, dim=-2)[..., :i]
             solved = row + (row.unsqueeze(-1) * sub).sum(dim=-2)
             solved_rows.append(torch.cat((solved, attn[..., i, i:]), dim=-1))
-        return torch.stack(solved_rows, dim=-2) + eye.to(dtype=attn.dtype)
+        return torch.stack(solved_rows, dim=-2) + eye.to(device=attn.device, dtype=attn.dtype)
 
     def _solve_chunk_attn_tree(self, attn: torch.Tensor, mask: torch.Tensor, eye: torch.Tensor, chunk_size: int):
         if chunk_size <= 0 or (chunk_size & (chunk_size - 1)) != 0:
@@ -965,7 +965,7 @@ class QEffQwen3_5MoeGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         decay_mask = (decay_mask * (~mask_strict).float()).to(self.torch_dtype)
 
         attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
-        I_base = eye if eye is not None else torch.eye(chunk_size, dtype=attn.dtype)
+        I_base = eye if eye is not None else torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
         attn = self._solve_chunk_attn(attn=attn, mask=mask, eye=I_base, chunk_size=chunk_size)
 
         value = attn @ v_beta
