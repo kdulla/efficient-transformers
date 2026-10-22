@@ -5126,8 +5126,9 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             self.model.config.qeff_csa_prefill_only = prefill_only is True
             self.model.config.qeff_hca_prefill_only = prefill_only is True
 
-        weightfree_decode_only = self._weight_free and self.model.config.model_type == "qwen4_exp_text"
-        if self._weight_free and (prefill_only is True or (prefill_seq_len == 1 and not weightfree_decode_only)):
+        weight_free = getattr(self, "_weight_free", False)
+        weightfree_decode_only = weight_free and self.model.config.model_type == "qwen4_exp_text"
+        if weight_free and (prefill_only is True or (prefill_seq_len == 1 and not weightfree_decode_only)):
             raise NotImplementedError(
                 "weight_free=True is not supported with disaggregated compile (prefill_only=True or prefill_seq_len=1)."
             )
@@ -5270,6 +5271,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         # keys must match those names so the compiler pairs and retains them correctly.
         kv_cache_prefix = validate_kv_cache_prefix(kv_cache_prefix)
         custom_io = {}
+        is_deepseek_v4 = getattr(self.model.config, "model_type", None) == "deepseek_v4"
         if is_deepseek_v4:
             if mxint8_kv_cache:
                 raise ValueError("DeepSeek V4 retained-state caches must remain in float16; mxint8 is not supported.")

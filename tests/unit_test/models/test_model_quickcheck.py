@@ -231,7 +231,7 @@ def test_deepseek_v4_csa_dp_cache_layout_uses_dp_context_ops():
 
     csa_cache = cache[2]
     assert csa_cache[0].shape == (1, 2, 8, config.head_dim)
-    assert csa_cache[3].shape == (1, 2, 4, config.head_dim)
+    assert csa_cache[3].shape == (1, 2, 4, 2 * config.head_dim)
 
     with torch.no_grad():
         output = qeff_model(
@@ -255,7 +255,7 @@ def test_deepseek_v4_csa_dp_cp_indexer_cache_layout_decodes():
     cache = qeff_model.get_dummy_pkv_cache(config, batch_size=4, ctx_len=8)
 
     assert cache[2][0].shape == (1, 4, config.sliding_window, config.head_dim)
-    assert cache[2][6].shape == (2, 2, 4, config.index_head_dim)
+    assert cache[2][6].shape == (2, 2, 4, 2 * config.index_head_dim)
 
     with torch.no_grad():
         for position, tokens in enumerate(((3, 7, 9, 15), (5, 11, 19, 21), (13, 17, 23, 27))):
@@ -268,7 +268,7 @@ def test_deepseek_v4_csa_dp_cp_indexer_cache_layout_decodes():
             cache = output.past_key_values
             assert torch.isfinite(output.logits).all()
 
-    assert cache[2][6].shape == (2, 2, 4, config.index_head_dim)
+    assert cache[2][6].shape == (2, 2, 4, 2 * config.index_head_dim)
 
 
 def test_deepseek_v4_example_parallel_layout_controls():
@@ -284,12 +284,12 @@ def test_deepseek_v4_example_parallel_layout_controls():
     assert MICROBENCH_DEFAULTS["attn_dp"] == 16
     assert MICROBENCH_DEFAULTS["indexer_cp"] == 16
     assert MICROBENCH_DEFAULTS["num_hidden_layers"] == 4
-    assert MICROBENCH_DEFAULTS["num_kv_blocks"] == 16
+    assert MICROBENCH_DEFAULTS["num_kv_blocks"] == 1
     assert MICROBENCH_DEFAULTS["hca_compressed_kv_cp"] == 2
     assert MICROBENCH_DEFAULTS["hca_attn_blocks"] == 8
     assert MICROBENCH_DEFAULTS["hw_version"] == "ai100"
     assert MICROBENCH_DEFAULTS["ffn_blocking_mode"] == "token"
-    assert MICROBENCH_DEFAULTS["ffn_token_block_size"] == 1
+    assert MICROBENCH_DEFAULTS["ffn_token_block_size"] == 4
     assert PREFILL_MICROBENCH_DEFAULTS["csa_prefill_attn_gather_sub_qc"] == 4
     assert PREFILL_MICROBENCH_DEFAULTS["csa_prefill_indexer_kv_block_size"] == 512
     assert PREFILL_MICROBENCH_DEFAULTS["csa_prefill_indexer_topk_per_block"] == 4
@@ -387,7 +387,7 @@ def test_deepseek_v4_blocked_csa_indexer_matches_batch_major_decode():
 
     reference_cache = reference_model.get_dummy_pkv_cache(config, batch_size=2, ctx_len=16)
     blocked_cache = blocked_model.get_dummy_pkv_cache(blocked_config, batch_size=2, ctx_len=16)
-    assert blocked_cache[2][6].shape == (1, 2, 8, config.index_head_dim)
+    assert blocked_cache[2][6].shape == (1, 2, 4, 2 * config.index_head_dim)
 
     for position, tokens in enumerate(((3, 7), (5, 11), (13, 17), (19, 23), (29, 31), (37, 41))):
         input_ids = torch.tensor(tokens).unsqueeze(1)
@@ -528,9 +528,9 @@ def test_deepseek_v4_csa_dp_cp_export_uses_requested_capture_layout(monkeypatch)
 
     csa_indexer_cache = captured["example_inputs"]["past_key_values"][2][6]
     assert captured["example_inputs"]["input_ids"].shape == (4, 1)
-    assert csa_indexer_cache.shape == (2, 2, 4, config.index_head_dim)
-    assert captured["dynamic_axes"]["past_sliding_window_kv.2"] == {}
-    assert captured["dynamic_axes"]["past_actual_indexer_compressed_kv.2"] == {}
+    assert csa_indexer_cache.shape == (2, 2, 4, 2 * config.index_head_dim)
+    assert captured["dynamic_axes"]["past_sliding_window_kv.0"] == {0: "batch_size", 2: "ctx_len"}
+    assert captured["dynamic_axes"]["past_indexer_kv_cache.2"] == {}
 
 
 def test_deepseek_v4_hca_dp_export_uses_requested_capture_layout(monkeypatch):
@@ -553,7 +553,7 @@ def test_deepseek_v4_hca_dp_export_uses_requested_capture_layout(monkeypatch):
     hca_cache = captured["example_inputs"]["past_key_values"][0]
     assert hca_cache[0].shape == (1, 2, config.sliding_window, config.head_dim)
     assert hca_cache[3].shape == (1, 2, 4, config.head_dim)
-    assert captured["dynamic_axes"]["past_sliding_window_kv.0"] == {}
+    assert captured["dynamic_axes"]["past_sliding_window_kv.0"] == {1: "batch_size"}
     assert captured["dynamic_axes"]["past_actual_compressed_kv.0"] == {}
 
 

@@ -991,7 +991,7 @@ class QEffQwen3_5MoeGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         core_attn_out = torch.stack(chunk_outputs, dim=2).to(value.dtype)
         if not output_final_state:
             last_recurrent_state = None
-        core_attn_out = torch.stack(output_chunks, dim=2)
+        core_attn_out = torch.stack(chunk_outputs, dim=2)
         core_attn_out = core_attn_out.reshape(
             core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
         )
@@ -1540,7 +1540,7 @@ class QEffQwen3_5MoeTextModel(Qwen3_5MoeTextModel):
         elif not is_layerwise_active():
             target_length = past_seen_tokens
         else:
-            target_length = past_seen_tokens + text_position_ids.shape[-1]
+            target_length = max(past_seen_tokens, text_position_ids.shape[-1])
         causal_mask = _create_causal_mask(
             position_ids=text_position_ids, target_length=target_length, sliding_window=None
         )

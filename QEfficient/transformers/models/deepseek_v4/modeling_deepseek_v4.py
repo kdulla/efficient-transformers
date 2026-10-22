@@ -150,6 +150,9 @@ class QEffSlidingCacheLayer(CacheLayerMixin):
     def get_max_cache_shape(self) -> int:
         return self.max_cache_len
 
+    def get_max_length(self) -> int:
+        return self.max_cache_len
+
     def update(
         self,
         key_states: torch.Tensor,
@@ -430,6 +433,9 @@ class QEffHCACacheLayer(CacheLayerMixin):
         return self.cumulative_length + query_length, kv_offset
 
     def get_max_cache_shape(self) -> int:
+        return self.max_cache_len
+
+    def get_max_length(self) -> int:
         return self.max_cache_len
 
     def update(
@@ -921,6 +927,9 @@ class QEffCSACacheLayer(CacheLayerMixin):
         return self.cumulative_length + query_length, kv_offset
 
     def get_max_cache_shape(self) -> int:
+        return self.max_cache_len
+
+    def get_max_length(self) -> int:
         return self.max_cache_len
 
     def update(
