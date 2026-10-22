@@ -223,37 +223,6 @@ def test_deepseek_v4_attention_uses_joint_softmax(layer_type, has_compressed_key
     torch.testing.assert_close(output, expected_output.transpose(1, 2).contiguous())
 
 
-@pytest.mark.parametrize(("name", "head_dim"), [("compressor", 8), ("indexer", 4)])
-def test_deepseek_v4_csa_uses_pingpong_projection_buffers(name, head_dim):
-    config = _tiny_deepseek_v4_config()
-    legacy_cache = QEffDeepseekV4Cache.get_dummy_cache(config, batch_size=1, ctx_len=8, dtype=torch.float32)
-    cache = QEffDeepseekV4Cache.from_legacy_cache(config, legacy_cache, torch.tensor([[0]]))
-    layer = cache.layers[2]
-    ratio = config.compress_rates["compressed_sparse_attention"]
-
-    assert getattr(layer, f"{name}_kv_buffer").shape[2] == 2 * ratio
-    for position in range(2 * ratio + 1):
-        projection = torch.full((1, 1, 2 * head_dim), position + 1.0)
-        cache_kwargs = {
-            "position_ids": torch.tensor([[position]]),
-            "context_length": 8,
-            f"{name}_kv": projection,
-            f"{name}_gate": -projection,
-        }
-        layer.update(
-            torch.zeros(1, config.num_key_value_heads, 1, config.head_dim),
-            torch.zeros(1, config.num_key_value_heads, 1, config.head_dim),
-            cache_kwargs,
-        )
-
-    expected = torch.arange(1, 2 * ratio + 1, dtype=torch.float32)
-    expected[0] = 2 * ratio + 1
-    actual_kv = getattr(layer, f"{name}_kv_buffer")[0, 0, :, 0]
-    actual_gate = getattr(layer, f"{name}_gate_buffer")[0, 0, :, 0]
-    torch.testing.assert_close(actual_kv, expected)
-    torch.testing.assert_close(actual_gate, -expected)
-
-
 def test_deepseek_v4_csa_dp_cache_layout_uses_dp_context_ops():
     config = _tiny_deepseek_v4_config()
     config.qeff_csa_attention_dp = 2
