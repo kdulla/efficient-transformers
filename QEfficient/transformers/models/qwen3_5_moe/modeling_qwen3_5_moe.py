@@ -275,6 +275,10 @@ class QEffQwen3_5MoeDynamicCache(Cache):
             raise ValueError(f"Layer {layer_idx} is not a full_attention layer")
         return layer.read_only_blocked_kv(start_index, end_index, cache_kwargs)
 
+    def read_only_blockedKV(self, start_index: int, end_index: int, layer_idx: int, cache_kwargs: dict):
+        """Compatibility alias for callers using the legacy combined K/V name."""
+        return self.read_only_blocked_kv(start_index, end_index, layer_idx, cache_kwargs)
+
     def read_only_blocked_K(self, start_index: int, end_index: int, layer_idx: int, cache_kwargs: dict):
         layer = self.kv_layers[layer_idx]
         if layer is None:

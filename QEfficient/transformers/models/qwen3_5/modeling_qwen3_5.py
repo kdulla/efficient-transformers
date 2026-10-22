@@ -229,6 +229,10 @@ class QEffQwen3_5DynamicCache(Cache):
             raise ValueError(f"Layer {layer_idx} is not a full_attention layer")
         return layer.read_only_blocked_kv(start_index, end_index, cache_kwargs)
 
+    def read_only_blockedKV(self, start_index: int, end_index: int, layer_idx: int, cache_kwargs: dict):
+        """Compatibility alias for callers using the legacy combined K/V name."""
+        return self.read_only_blocked_kv(start_index, end_index, layer_idx, cache_kwargs)
+
     def read_only_blocked_K(self, start_index: int, end_index: int, layer_idx: int, cache_kwargs: dict):
         layer = self.kv_layers[layer_idx]
         if layer is None:
@@ -1296,8 +1300,8 @@ class QEffQwen3_5TextModel(Qwen3_5TextModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         start, end = resolve_layer_window(QEffQwen3_5TextModel, len(self.layers))
+        past_seen_tokens = past_key_values.get_seq_length(layer_idx=start) if past_key_values is not None else 0
         if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length(layer_idx=start) if past_key_values is not None else 0
             active_layer_type = self.config.layer_types[start] if start < len(self.config.layer_types) else None
             if is_layerwise_active() and position_ids is not None and active_layer_type == "linear_attention":
                 text_position_ids = position_ids[0] if position_ids.ndim == 3 else position_ids
@@ -1314,8 +1318,13 @@ class QEffQwen3_5TextModel(Qwen3_5TextModel):
 
         if isinstance(attention_mask, torch.Tensor):
             target_length = attention_mask.shape[-1]
+        elif past_seen_tokens > 0:
+            # QEff caches are preallocated.  ``past_seen_tokens`` therefore
+            # represents the cache storage length, not the number of tokens
+            # that should be appended to it for this forward pass.
+            target_length = past_seen_tokens
         else:
-            target_length = past_seen_tokens + text_position_ids.shape[-1]
+            target_length = text_position_ids.shape[-1]
         causal_mask = _create_causal_mask(
             position_ids=text_position_ids, target_length=target_length, sliding_window=None
         )
