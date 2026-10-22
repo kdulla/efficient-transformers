@@ -1794,8 +1794,16 @@ class _QEffAutoModelForImageTextToTextDualQPC:
                 **kwargs,
             )
         bs: int = constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE
-        seq_len: int = constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN
+        seq_len: int = int(
+            prefill_seq_len if prefill_seq_len is not None else kwargs.get("prefill_seq_len", constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN)
+        )
         qaic_config = kwargs.get("qaic_config", getattr(self.lang_model.model, "qaic_config", None))
+        if self.model.config.model_type == "minimax_m3_vl" and qaic_config:
+            dp_factors = [
+                int(qaic_config.get(key, 1) or 1)
+                for key in ("msa_indexer_dp", "msa_attn_dp", "attn_dp")
+            ]
+            bs = max(bs, max(dp_factors))
         gdn_export_kwargs = _get_gdn_full_state_update_kwargs(
             self.model,
             qaic_config,
@@ -1808,6 +1816,8 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             else:
                 self.__update_prefill_transform(False, retain_full_kv=kwargs.get("retain_full_kv", False))
         onnx_kwargs = {"prefill_seq_len": seq_len, "batch_size": bs}
+        if "ctx_len" in kwargs:
+            onnx_kwargs["ctx_len"] = kwargs["ctx_len"]
         dynamic_axes_kwargs = {
             "kv_offload": True,
             "continuous_batching": self.continuous_batching,
@@ -2317,6 +2327,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
                     prefill_only=prefill_only,
                     enable_chunking=enable_chunking,
                     prefill_seq_len=prefill_seq_len,
+                    ctx_len=ctx_len,
                     num_cores=num_cores,
                     qaic_config=qaic_config,
                     _layerwise_cache_probe=layerwise_cache_probe,

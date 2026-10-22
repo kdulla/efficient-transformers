@@ -1283,6 +1283,14 @@ class QEFFBaseModel(ABC):
             self.hash_params.pop("gated_delta_kwargs", None)
         self.model, _ = FFNBlockingTransform.apply(self.model, qaic_config=qaic_config)
         if qaic_config is not None:
+            mode = qaic_config.get("ffn_blocking_mode", "default")
+            token_block_size = qaic_config.get("ffn_token_block_size")
+            weight_block_size = qaic_config.get("ffn_weight_block_size")
+            for module in self.model.modules():
+                configure = getattr(module, "configure_ffn_blocking", None)
+                if callable(configure):
+                    configure(mode, token_block_size, weight_block_size)
+        if qaic_config is not None:
             self.hash_params["qsa_config"] = {
                 key: qaic_config[key]
                 for key in (

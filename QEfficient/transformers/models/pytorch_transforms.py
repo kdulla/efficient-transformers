@@ -1869,7 +1869,7 @@ class FFNBlockingTransform(PytorchTransform):
 
         transformed = False
         for module in model.modules():
-            if isinstance(module, QEffDeepseekV4Experts):
+            if isinstance(module, QEffDeepseekV4Experts) or callable(getattr(module, "configure_ffn_blocking", None)):
                 module.configure_ffn_blocking(mode, token_block_size, weight_block_size)
                 transformed = True
 
@@ -2375,7 +2375,7 @@ class OptimizedMoEExpertParallelWeightsTransform(PytorchTransform):
 class FFNBlockingTransform(PytorchTransform):
     """Configure optional token tiling for optimized routed MoE FFNs."""
 
-    _VALID_MODES = {"default", "token"}
+    _VALID_MODES = {"default", "token", "weight", "token_weight"}
 
     @classmethod
     def apply(cls, model: nn.Module, qaic_config: Optional[dict] = None) -> Tuple[nn.Module, bool]:

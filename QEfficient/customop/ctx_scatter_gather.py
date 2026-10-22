@@ -1206,10 +1206,11 @@ def CtxGatherPagedKVDP(data: onnxscript.FLOAT, block_ids: onnxscript.INT32) -> o
     page_size = ops.Gather(data_shape, [2])
     head_dim = ops.Gather(data_shape, [3])
     num_pages = ops.Gather(ids_shape, [0])
-    zero = ops.Constant(value_ints=[0])
-    one = ops.Constant(value_ints=[1])
+    zero = ops.Constant(value_int=0)
+    one = ops.Constant(value_int=1)
+    num_rows_scalar = ops.Squeeze(num_rows, axes=[0])
     row_idx = ops.Expand(
-        ops.Unsqueeze(ops.Range(zero, num_rows, one), [0]),
+        ops.Unsqueeze(ops.Range(zero, num_rows_scalar, one), [0]),
         ops.Concat(num_pages, num_rows, axis=0),
     )
     indices = ops.Concat(
@@ -1221,7 +1222,7 @@ def CtxGatherPagedKVDP(data: onnxscript.FLOAT, block_ids: onnxscript.INT32) -> o
     pages = ops.Transpose(pages, perm=[1, 0, 2, 3])
     return ops.Reshape(
         pages,
-        ops.Concat(one, num_rows, ops.Mul(num_pages, page_size), head_dim, axis=0),
+        ops.Concat(ops.Constant(value_ints=[1]), num_rows, ops.Mul(num_pages, page_size), head_dim, axis=0),
     )
 
 

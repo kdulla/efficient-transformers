@@ -22,6 +22,17 @@ from QEfficient.utils.logging_utils import QEFFLogger
 logger = QEFFLogger.get_logger("INFRA")
 
 
+def huggingface_hub_cache_dir() -> Path:
+    """Return the Hugging Face Hub cache root used by ``snapshot_download``."""
+    if hf_hub_cache := os.environ.get("HF_HUB_CACHE"):
+        return Path(hf_hub_cache).expanduser()
+    if hf_home := os.environ.get("HF_HOME"):
+        return Path(hf_home).expanduser() / "hub"
+    if xdg_cache_home := os.environ.get("XDG_CACHE_HOME"):
+        return Path(xdg_cache_home).expanduser() / "huggingface" / "hub"
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
 def load_checkpoint_weights(checkpoint_path: str, keys: set[str]) -> dict[str, torch.Tensor]:
     """Read selected tensors from safetensors; pickle-backed PyTorch checkpoints are unsupported for security."""
     path = Path(checkpoint_path)
