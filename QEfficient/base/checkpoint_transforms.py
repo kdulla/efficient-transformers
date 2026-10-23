@@ -164,6 +164,7 @@ class CheckpointPlanningContext:
     task_plans: list[CheckpointTaskPlan] = field(default_factory=list)
     direct_tasks: list[CheckpointTask] = field(default_factory=list)
     claimed_raw_refs: set[TensorRef] = field(default_factory=set)
+    excluded_raw_refs: dict[TensorRef, str] = field(default_factory=dict)
     active_layout_ids: list[str] = field(default_factory=list)
 
     def add_task_plan(self, task_plan: CheckpointTaskPlan, *, layout_transform_id: Optional[str] = None) -> None:
@@ -174,7 +175,7 @@ class CheckpointPlanningContext:
                 f"Checkpoint task {task_plan.task_id} references unknown source keys: "
                 f"{sorted(ref.key for ref in unknown_refs)}"
             )
-        overlap = raw_refs & self.claimed_raw_refs
+        overlap = raw_refs & (self.claimed_raw_refs | set(self.excluded_raw_refs))
         if overlap:
             raise ValueError(
                 f"Checkpoint task {task_plan.task_id} reclaims raw tensor keys: {sorted(ref.key for ref in overlap)}"
@@ -186,7 +187,7 @@ class CheckpointPlanningContext:
 
     def add_direct_task(self, task: CheckpointTask) -> None:
         raw_refs = {ref for ref in task.input_refs if ref.stage == "raw"}
-        overlap = raw_refs & self.claimed_raw_refs
+        overlap = raw_refs & (self.claimed_raw_refs | set(self.excluded_raw_refs))
         if overlap:
             raise ValueError(
                 f"Checkpoint task {task.task_id} reclaims raw tensor keys: {sorted(ref.key for ref in overlap)}"
@@ -194,8 +195,26 @@ class CheckpointPlanningContext:
         self.claimed_raw_refs.update(raw_refs)
         self.direct_tasks.append(task)
 
+    def exclude_raw_keys(self, keys, *, reason: str) -> None:
+        """Mark source tensors that are intentionally absent from the prepared checkpoint."""
+        refs = {TensorRef(key) for key in keys}
+        unknown_refs = {ref for ref in refs if ref.key not in self.weight_map}
+        if unknown_refs:
+            raise ValueError(
+                f"Checkpoint exclusions reference unknown source keys: {sorted(ref.key for ref in unknown_refs)}"
+            )
+        overlap = refs & self.claimed_raw_refs
+        if overlap:
+            raise ValueError(f"Checkpoint exclusions reclaim planned keys: {sorted(ref.key for ref in overlap)}")
+        conflicting = {ref for ref in refs if ref in self.excluded_raw_refs and self.excluded_raw_refs[ref] != reason}
+        if conflicting:
+            raise ValueError(
+                f"Checkpoint keys were excluded for conflicting reasons: {sorted(ref.key for ref in conflicting)}"
+            )
+        self.excluded_raw_refs.update({ref: reason for ref in refs})
+
     def remaining_weight_map(self) -> dict[str, str]:
-        claimed_keys = {ref.key for ref in self.claimed_raw_refs}
+        claimed_keys = {ref.key for ref in self.claimed_raw_refs | set(self.excluded_raw_refs)}
         return {key: shard for key, shard in self.weight_map.items() if key not in claimed_keys}
 
     def materialize_tasks(self) -> list[CheckpointTask]:
@@ -303,15 +322,19 @@ class CheckpointPlan:
     source_fingerprint: list[dict]
     transform_ids: tuple[str, ...]
     active_group_id: str = "none"
+    excluded_raw_refs: tuple[tuple[str, str], ...] = ()
 
     def fingerprint_payload(self) -> dict[str, object]:
-        return {
+        payload = {
             "target_dtype": str(self.target_dtype),
             "source_fingerprint": self.source_fingerprint,
             "active_group_id": self.active_group_id,
             "transform_ids": list(self.transform_ids),
             "tasks": [task.fingerprint() for task in self.tasks],
         }
+        if self.excluded_raw_refs:
+            payload["excluded_raw_refs"] = [list(item) for item in self.excluded_raw_refs]
+        return payload
 
 
 def execute_checkpoint_plan(
@@ -700,7 +723,8 @@ class CheckpointTransformPipeline:
             raise ValueError("Checkpoint plan contains duplicate output tensor references.")
 
         planned_raw_keys = {ref.key for task in tasks for ref in task.input_refs if ref.stage == "raw"}
-        missing_raw_keys = set(weight_map) - planned_raw_keys
+        excluded_raw_keys = {ref.key for ref in context.excluded_raw_refs}
+        missing_raw_keys = set(weight_map) - planned_raw_keys - excluded_raw_keys
         if missing_raw_keys:
             raise ValueError(f"Checkpoint plan does not cover source keys: {sorted(missing_raw_keys)}")
 
@@ -718,6 +742,7 @@ class CheckpointTransformPipeline:
             source_fingerprint=_checkpoint_file_fingerprint(src),
             transform_ids=tuple(transform_ids),
             active_group_id=active_group_id,
+            excluded_raw_refs=tuple(sorted((ref.key, reason) for ref, reason in context.excluded_raw_refs.items())),
         )
         return plan, active_group_id
 

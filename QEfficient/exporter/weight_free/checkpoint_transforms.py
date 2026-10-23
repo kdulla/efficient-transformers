@@ -465,79 +465,132 @@ class DeepseekV4CheckpointTransform(BaseCheckpointTransform):
         return renamed if renamed.startswith("lm_head.") else f"model.{renamed}"
 
     @classmethod
-    def apply(
-        cls,
-        src: Path,
-        out: Path,
-        target_dtype: torch.dtype = torch.float32,
-        num_hidden_layers: Optional[int] = None,
-        moe_prefill_num_pipeline_stages: Optional[int] = None,
-        moe_prefill_num_parallelized_experts: Optional[int] = None,
-        **kwargs,
-    ) -> bool:
-        """Rename dense tensors and dequantize/stack the selected routed-expert layers."""
-        if (moe_prefill_num_pipeline_stages is None) != (moe_prefill_num_parallelized_experts is None):
-            raise ValueError("DeepSeek V4 expert-parallel checkpoint packing requires both layout dimensions.")
-        sentinel = out / _SENTINEL
-        if sentinel.exists():
-            logger.info("DeepseekV4CheckpointTransform: prepared checkpoint exists, skipping.")
-            return False
+    def plan_tasks(cls, context: CheckpointPlanningContext) -> None:
+        """Plan native key conversion and routed-expert materialization."""
+        config = context.config
+        num_hidden_layers = getattr(config, "num_hidden_layers", None)
+        flavour = context.hash_params.get("moe_prefill_flavour", "none")
+        flavour = getattr(flavour, "value", flavour)
+        expert_parallel = flavour == "expert_parallel"
+        num_pipeline_stages = context.hash_params.get("moe_prefill_num_pipeline_stages") if expert_parallel else None
+        num_parallelized_experts = (
+            context.hash_params.get("moe_prefill_num_parallelized_experts") if expert_parallel else None
+        )
+        if expert_parallel and (num_pipeline_stages is None or num_parallelized_experts is None):
+            raise ValueError(
+                "DeepSeek V4 expert-parallel checkpoint packing requires pipeline stages and parallelized experts."
+            )
+        if num_pipeline_stages is not None:
+            num_pipeline_stages = int(num_pipeline_stages)
+            num_parallelized_experts = int(num_parallelized_experts)
 
-        out.mkdir(parents=True, exist_ok=True)
-        copy_checkpoint_aux_files(src, out)
-        weight_map = read_weight_map(src)
-        expert_entries: Dict[Tuple[int, int, str], Dict[str, Tuple[str, str]]] = {}
+        expert_entries: Dict[Tuple[int, int, str], Dict[str, str]] = {}
         base_entries: Dict[str, str] = {}
+        excluded_by_reason: Dict[str, list[str]] = {}
 
-        for key, shard_name in weight_map.items():
+        def exclude(key: str, reason: str) -> None:
+            excluded_by_reason.setdefault(reason, []).append(key)
+
+        for key, shard_name in context.weight_map.items():
             expert_match = cls.EXPERT_RE.match(key)
             if expert_match:
                 layer_idx, expert_idx, projection, tensor_kind = expert_match.groups()
                 layer_idx = int(layer_idx)
-                if num_hidden_layers is None or layer_idx < num_hidden_layers:
-                    expert_entries.setdefault((layer_idx, int(expert_idx), projection), {})[tensor_kind] = (
-                        shard_name,
-                        key,
-                    )
+                if num_hidden_layers is not None and layer_idx >= num_hidden_layers:
+                    exclude(key, "outside configured DeepSeek V4 layer range")
+                else:
+                    expert_entries.setdefault((layer_idx, int(expert_idx), projection), {})[tensor_kind] = key
                 continue
 
             layer_match = re.match(r"^layers\.(\d+)\.", key)
             if layer_match and num_hidden_layers is not None and int(layer_match.group(1)) >= num_hidden_layers:
+                exclude(key, "outside configured DeepSeek V4 layer range")
                 continue
             if key.startswith("mtp."):
+                exclude(key, "DeepSeek V4 MTP weights are not exported")
                 continue
-            if key.endswith(".scale") and key[: -len(".scale")] + ".weight" in weight_map:
+            if key.endswith(".scale") and key[: -len(".scale")] + ".weight" in context.weight_map:
                 continue
             base_entries[key] = shard_name
 
-        new_weight_map: Dict[str, str] = {}
+        for reason, keys in excluded_by_reason.items():
+            context.exclude_raw_keys(keys, reason=reason)
+
         base_by_shard: Dict[str, list[str]] = {}
         for key, shard_name in base_entries.items():
             base_by_shard.setdefault(shard_name, []).append(key)
 
         for shard_idx, (shard_name, keys) in enumerate(sorted(base_by_shard.items())):
-            tensors: Dict[str, torch.Tensor] = {}
-            with safe_open(str(src / shard_name), framework="pt") as checkpoint:
-                for key in keys:
-                    tensor = checkpoint.get_tensor(key)
-                    renamed_key = cls._rename_key(key, weight_map)
-                    is_quantized_weight = key.endswith(".weight") and key[: -len(".weight")] + ".scale" in weight_map
-                    if is_quantized_weight:
-                        scale_shard = weight_map[key[: -len(".weight")] + ".scale"]
-                        with safe_open(str(src / scale_shard), framework="pt") as scale_checkpoint:
-                            scale = scale_checkpoint.get_tensor(key[: -len(".weight")] + ".scale")
-                        from transformers.integrations.finegrained_fp8 import Fp8Dequantize
+            source_keys = tuple(sorted(keys))
+            input_keys = list(source_keys)
+            output_keys = []
+            for key in source_keys:
+                scale_key = key[: -len(".weight")] + ".scale" if key.endswith(".weight") else None
+                if scale_key in context.weight_map:
+                    input_keys.append(scale_key)
+                output_keys.append(cls._rename_key(key, context.weight_map))
+            input_keys = tuple(dict.fromkeys(input_keys))
+            input_refs = tuple(TensorRef(key) for key in input_keys)
+            output_refs = tuple(TensorRef(key, "final") for key in output_keys)
 
-                        tensor = Fp8Dequantize(None)._dequantize_one(tensor, scale, target_dtype)
-                    elif tensor.is_floating_point() and not renamed_key.endswith("weight_scale_inv"):
+            def runner(
+                get_tensor,
+                target_dtype,
+                source_keys=source_keys,
+                output_refs=output_refs,
+            ):
+                from transformers.integrations.finegrained_fp8 import Fp8Dequantize
+
+                outputs = {}
+                dequantizer = Fp8Dequantize(None)
+                for key, output_ref in zip(source_keys, output_refs):
+                    tensor = get_tensor(TensorRef(key))
+                    scale_key = key[: -len(".weight")] + ".scale" if key.endswith(".weight") else None
+                    if scale_key in context.weight_map:
+                        tensor = dequantizer._dequantize_one(
+                            tensor,
+                            get_tensor(TensorRef(scale_key)),
+                            target_dtype,
+                        )
+                    elif tensor.is_floating_point() and not output_ref.key.endswith("weight_scale_inv"):
                         tensor = tensor.to(target_dtype)
-                    if renamed_key.endswith("weight_scale_inv"):
+                    if output_ref.key.endswith("weight_scale_inv"):
                         tensor = cls._decode_ue8m0_scale(tensor)
-                    tensors[renamed_key] = tensor
+                    outputs[output_ref] = tensor
+                return outputs
 
-            out_name = f"base-{shard_idx:04d}.safetensors"
-            atomic_save(tensors, out / out_name)
-            new_weight_map.update({cls._rename_key(key, weight_map): out_name for key in keys})
+            output_file = f"base-{shard_idx:04d}.safetensors"
+            task_plan = CheckpointTaskPlan(
+                task_id=f"{cls.TRANSFORM_ID}:base:{shard_idx}",
+                input_refs=input_refs,
+                source_files=tuple(sorted({context.weight_map[key] for key in input_keys})),
+                output_file=output_file,
+                estimated_peak_bytes=_estimate_task_bytes(
+                    context.source_dir,
+                    context.weight_map,
+                    input_keys,
+                    context.target_dtype,
+                ),
+                params=TaskParams(
+                    cls.TRANSFORM_ID,
+                    _task_values(
+                        output_file=output_file,
+                        output_keys=tuple(output_keys),
+                        source_keys=source_keys,
+                    ),
+                ),
+            )
+            task_plan.append_stage(
+                CheckpointStage(
+                    stage_id="rename_and_dequantize",
+                    input_refs=input_refs,
+                    output_refs=output_refs,
+                    params=TaskParams(cls.TRANSFORM_ID, _task_values(output_keys=tuple(output_keys))),
+                    runner=runner,
+                    labels=("rename", "dequantize"),
+                )
+            )
+            context.add_task_plan(task_plan, layout_transform_id=cls.TRANSFORM_ID)
 
         layer_indices = sorted({layer_idx for layer_idx, _, _ in expert_entries})
         for layer_idx in layer_indices:
@@ -549,64 +602,131 @@ class DeepseekV4CheckpointTransform(BaseCheckpointTransform):
             expert_indices = sorted({expert_idx for expert_idx, _ in layer_entries})
             if expert_indices != list(range(len(expert_indices))):
                 raise ValueError(f"DeepSeek-V4 layer {layer_idx} has non-contiguous routed expert indices.")
-
             projections = {projection for _, projection in layer_entries}
             if projections != {"w1", "w2", "w3"}:
                 raise ValueError(f"DeepSeek-V4 layer {layer_idx} is missing routed-expert projections: {projections}")
-
-            from transformers.integrations.finegrained_fp8 import Fp8Dequantize
-
-            dequantizer = Fp8Dequantize(None)
-            dequantized = {"w1": [], "w2": [], "w3": []}
             for expert_idx in expert_indices:
                 for projection in ("w1", "w2", "w3"):
-                    entry = layer_entries[(expert_idx, projection)]
-                    if set(entry) != {"weight", "scale"}:
+                    if set(layer_entries[(expert_idx, projection)]) != {"weight", "scale"}:
                         raise ValueError(
-                            f"DeepSeek-V4 layer {layer_idx} expert {expert_idx} {projection} is missing weight or scale."
+                            f"DeepSeek-V4 layer {layer_idx} expert {expert_idx} {projection} "
+                            "is missing weight or scale."
                         )
-                    weight_shard, weight_key = entry["weight"]
-                    scale_shard, scale_key = entry["scale"]
-                    with safe_open(str(src / weight_shard), framework="pt") as checkpoint:
-                        weight = checkpoint.get_tensor(weight_key)
-                    with safe_open(str(src / scale_shard), framework="pt") as checkpoint:
-                        scale = checkpoint.get_tensor(scale_key)
-                    dequantized[projection].append(dequantizer._dequantize_one(weight, scale, target_dtype))
 
-            gate = torch.stack(dequantized["w1"]).transpose(1, 2)
-            up = torch.stack(dequantized["w3"]).transpose(1, 2)
-            down = torch.stack(dequantized["w2"]).transpose(1, 2)
-            if moe_prefill_num_pipeline_stages is None:
-                tensors = {
-                    f"model.layers.{layer_idx}.mlp.experts.gate_proj": gate,
-                    f"model.layers.{layer_idx}.mlp.experts.up_proj": up,
-                    f"model.layers.{layer_idx}.mlp.experts.down_proj": down,
-                }
-            else:
-                num_pipeline_stages = moe_prefill_num_pipeline_stages
-                num_parallelized_experts = moe_prefill_num_parallelized_experts
-                if len(expert_indices) != num_pipeline_stages * num_parallelized_experts:
+            if expert_parallel:
+                expected_experts = num_pipeline_stages * num_parallelized_experts
+                if len(expert_indices) != expected_experts:
                     raise ValueError(
                         f"DeepSeek-V4 layer {layer_idx} has {len(expert_indices)} experts, which does not match "
                         f"expert-parallel layout {num_pipeline_stages} x {num_parallelized_experts}."
                     )
+                output_keys = (
+                    f"model.layers.{layer_idx}.mlp.moe_weights.gate",
+                    f"model.layers.{layer_idx}.mlp.moe_weights.up",
+                    f"model.layers.{layer_idx}.mlp.moe_weights.down",
+                )
+                layout = "expert_parallel"
+            else:
+                output_keys = (
+                    f"model.layers.{layer_idx}.mlp.experts.gate_proj",
+                    f"model.layers.{layer_idx}.mlp.experts.up_proj",
+                    f"model.layers.{layer_idx}.mlp.experts.down_proj",
+                )
+                layout = "decode"
 
-                def pack(tensor: torch.Tensor) -> torch.Tensor:
-                    return tensor.view(num_pipeline_stages, num_parallelized_experts, *tensor.shape[1:]).transpose(0, 1)
+            ordered_entries = tuple(
+                (
+                    expert_idx,
+                    projection,
+                    layer_entries[(expert_idx, projection)]["weight"],
+                    layer_entries[(expert_idx, projection)]["scale"],
+                )
+                for expert_idx in expert_indices
+                for projection in ("w1", "w2", "w3")
+            )
+            input_keys = tuple(key for entry in ordered_entries for key in entry[2:])
+            input_refs = tuple(TensorRef(key) for key in input_keys)
+            output_refs = tuple(TensorRef(key, "final") for key in output_keys)
 
-                tensors = {
-                    f"model.layers.{layer_idx}.mlp.moe_weights.gate": pack(gate),
-                    f"model.layers.{layer_idx}.mlp.moe_weights.up": pack(up),
-                    f"model.layers.{layer_idx}.mlp.moe_weights.down": pack(down),
-                }
-            out_name = f"experts-layer-{layer_idx:05d}.safetensors"
-            atomic_save(tensors, out / out_name)
-            new_weight_map.update({key: out_name for key in tensors})
+            def runner(
+                get_tensor,
+                target_dtype,
+                ordered_entries=ordered_entries,
+                output_refs=output_refs,
+                layout=layout,
+                num_pipeline_stages=num_pipeline_stages,
+                num_parallelized_experts=num_parallelized_experts,
+            ):
+                from transformers.integrations.finegrained_fp8 import Fp8Dequantize
 
-        write_index(out, new_weight_map)
-        sentinel.touch()
-        logger.info("DeepseekV4CheckpointTransform: done → %s", out)
-        return True
+                dequantizer = Fp8Dequantize(None)
+                dequantized = {"w1": [], "w2": [], "w3": []}
+                for _, projection, weight_key, scale_key in ordered_entries:
+                    dequantized[projection].append(
+                        dequantizer._dequantize_one(
+                            get_tensor(TensorRef(weight_key)),
+                            get_tensor(TensorRef(scale_key)),
+                            target_dtype,
+                        )
+                    )
+
+                gate = torch.stack(dequantized["w1"]).transpose(1, 2)
+                up = torch.stack(dequantized["w3"]).transpose(1, 2)
+                down = torch.stack(dequantized["w2"]).transpose(1, 2)
+                tensors = (gate, up, down)
+                if layout == "expert_parallel":
+                    tensors = tuple(
+                        tensor.view(
+                            num_pipeline_stages,
+                            num_parallelized_experts,
+                            *tensor.shape[1:],
+                        ).transpose(0, 1)
+                        for tensor in tensors
+                    )
+                return {output_ref: tensor for output_ref, tensor in zip(output_refs, tensors)}
+
+            output_file = f"experts-layer-{layer_idx:05d}.safetensors"
+            task_plan = CheckpointTaskPlan(
+                task_id=f"{cls.TRANSFORM_ID}:experts:{layer_idx}",
+                input_refs=input_refs,
+                source_files=tuple(sorted({context.weight_map[key] for key in input_keys})),
+                output_file=output_file,
+                estimated_peak_bytes=_estimate_task_bytes(
+                    context.source_dir,
+                    context.weight_map,
+                    input_keys,
+                    context.target_dtype,
+                ),
+                params=TaskParams(
+                    cls.TRANSFORM_ID,
+                    _task_values(
+                        layer=layer_idx,
+                        layout=layout,
+                        num_experts=len(expert_indices),
+                        num_parallelized_experts=num_parallelized_experts,
+                        num_pipeline_stages=num_pipeline_stages,
+                        output_file=output_file,
+                    ),
+                ),
+            )
+            task_plan.append_stage(
+                CheckpointStage(
+                    stage_id="dequantize_and_stack_experts",
+                    input_refs=input_refs,
+                    output_refs=output_refs,
+                    params=TaskParams(
+                        cls.TRANSFORM_ID,
+                        _task_values(
+                            layout=layout,
+                            num_parallelized_experts=num_parallelized_experts,
+                            num_pipeline_stages=num_pipeline_stages,
+                        ),
+                    ),
+                    runner=runner,
+                    labels=("dequantize", "stack", layout),
+                )
+            )
+            context.add_task_plan(task_plan, layout_transform_id=cls.TRANSFORM_ID)
 
 
 # ---------------------------------------------------------------------------
@@ -1341,6 +1461,8 @@ def _plan_fused_stages(cls, context: CheckpointPlanningContext) -> None:
 # Backward-compatible aliases — existing callers keep working.
 GraniteMoeFusedExpertSplitCheckpointTransform = FusedExpertSplitCheckpointTransform
 MoEFusedExpertSplitCheckpointTransform = FusedExpertSplitCheckpointTransform
+
+
 class GlmMoeDsaReducedCheckpointTransform(BaseCheckpointTransform):
     """Prepare the approved four-layer GLM-MoE-DSA checkpoint slice.
 

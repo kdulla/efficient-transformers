@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -218,7 +219,7 @@ def _load_prepared_tensors(root):
 
 
 class TestWeightFreeCheckpointTransforms:
-    def test_prepares_native_deepseek_v4_checkpoint(self, tmp_path):
+    def test_prepares_native_deepseek_v4_checkpoint(self, tmp_path, monkeypatch):
         src = tmp_path / "src"
         out = tmp_path / "out"
         src.mkdir()
@@ -231,6 +232,8 @@ class TestWeightFreeCheckpointTransforms:
                 "layers.0.attn.wkv.weight": torch.ones(2, 4),
                 "layers.0.attn.wkv.scale": torch.full((1, 1), 0.5),
                 "layers.0.hc_attn_scale": torch.ones(1),
+                "layers.1.norm.weight": torch.ones(4),
+                "mtp.extra.weight": torch.ones(2, 2),
                 "layers.0.ffn.experts.0.w1.weight": torch.tensor([[0x21], [0x43]], dtype=torch.int8),
                 "layers.0.ffn.experts.0.w1.scale": torch.full((2, 1), 127, dtype=torch.uint8),
                 "layers.0.ffn.experts.0.w2.weight": torch.tensor([[0x21], [0x43]], dtype=torch.int8),
@@ -240,9 +243,31 @@ class TestWeightFreeCheckpointTransforms:
             },
         )
 
-        changed = DeepseekV4CheckpointTransform.apply(src, out, target_dtype=torch.float32, num_hidden_layers=1)
+        pipeline = CheckpointTransformPipeline([DeepseekV4CheckpointTransform, DtypeConversionCheckpointTransform])
+        config = SimpleNamespace(model_type="deepseek_v4", num_hidden_layers=1)
+        decode_plan, decode_group = pipeline.build_plan(src, torch.float32, config=config)
+        pipeline.apply(src, out, target_dtype=torch.float32, config=config, plan=decode_plan)
 
-        assert changed
+        assert decode_group == DeepseekV4CheckpointTransform.TRANSFORM_ID
+        assert dict(decode_plan.excluded_raw_refs) == {
+            "layers.1.norm.weight": "outside configured DeepSeek V4 layer range",
+            "mtp.extra.weight": "DeepSeek V4 MTP weights are not exported",
+        }
+
+        from QEfficient.exporter.weight_free.export import _prepare_checkpoint_for_weight_free_export
+        from QEfficient.utils import cache as cache_utils
+
+        checkpoint_cache = tmp_path / "checkpoint-cache"
+        monkeypatch.setattr(cache_utils, "QEFF_CHECKPOINT_HOME", checkpoint_cache)
+        qeff_model = SimpleNamespace(
+            hash_params={"pretrained_model_name_or_path": str(src)},
+            model=SimpleNamespace(config=config),
+            _checkpoint_transforms=[DeepseekV4CheckpointTransform, DtypeConversionCheckpointTransform],
+        )
+        prepared_path = Path(_prepare_checkpoint_for_weight_free_export(qeff_model, str(src), torch.float32))
+        assert prepared_path.parent == checkpoint_cache
+        assert (prepared_path / CHECKPOINT_PREPARED_MANIFEST).is_file()
+
         tensors = _load_prepared_tensors(out)
         assert "model.embed_tokens.weight" in tensors
         assert "lm_head.weight" in tensors
@@ -267,19 +292,46 @@ class TestWeightFreeCheckpointTransforms:
         torch.testing.assert_close(tensors["model.layers.0.mlp.experts.down_proj"], expected)
 
         prefill_out = tmp_path / "prefill-out"
-        changed = DeepseekV4CheckpointTransform.apply(
+        prefill_hash_params = {
+            "moe_prefill_flavour": "expert_parallel",
+            "moe_prefill_num_pipeline_stages": 1,
+            "moe_prefill_num_parallelized_experts": 1,
+        }
+        prefill_plan, prefill_group = pipeline.build_plan(
+            src,
+            torch.float32,
+            config=config,
+            hash_params=prefill_hash_params,
+        )
+        pipeline.apply(
             src,
             prefill_out,
             target_dtype=torch.float32,
-            num_hidden_layers=1,
-            moe_prefill_num_pipeline_stages=1,
-            moe_prefill_num_parallelized_experts=1,
+            config=config,
+            hash_params=prefill_hash_params,
+            plan=prefill_plan,
         )
 
-        assert changed
+        assert prefill_group == DeepseekV4CheckpointTransform.TRANSFORM_ID
+        assert prefill_plan.fingerprint_payload() != decode_plan.fingerprint_payload()
+        from QEfficient.exporter.weight_free.export import _prepared_checkpoint_hash
+
+        decode_hash = _prepared_checkpoint_hash(
+            model_ref=str(src),
+            target_dtype=torch.float32,
+            active_group_transform_id=decode_group,
+            plan_payload=decode_plan.fingerprint_payload(),
+        )
+        prefill_hash = _prepared_checkpoint_hash(
+            model_ref=str(src),
+            target_dtype=torch.float32,
+            active_group_transform_id=prefill_group,
+            plan_payload=prefill_plan.fingerprint_payload(),
+        )
+        assert decode_hash != prefill_hash
         prefill_tensors = _load_prepared_tensors(prefill_out)
         assert "model.layers.0.mlp.experts.gate_proj" not in prefill_tensors
-        assert prefill_tensors["model.layers.0.mlp.moe_weights.gate"].shape == (1, 1, 1, 2)
+        assert prefill_tensors["model.layers.0.mlp.moe_weights.gate"].shape == expected.unsqueeze(0).shape
         torch.testing.assert_close(prefill_tensors["model.layers.0.mlp.moe_weights.gate"], expected.unsqueeze(0))
 
     @pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="PyTorch does not provide UE8M0 tensors")

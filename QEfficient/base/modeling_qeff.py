@@ -277,8 +277,8 @@ def _restore_retained_state_output_names(model: onnx.ModelProto, output_names: L
             _rename_graph_value(model.graph, current_name, expected_name)
 
 
-def _normalize_minimax_retained_state_inputs(model: onnx.ModelProto) -> None:
-    """Pair MiniMax retained-state outputs with plain cache graph inputs."""
+def _normalize_retained_state_inputs(model: onnx.ModelProto) -> None:
+    """Pair retained-state outputs with plain cache graph inputs."""
     retained_state_suffixes = ("_InternalRetainedState", "_RetainedState")
     input_names = {value.name for value in model.graph.input}
     for value in model.graph.input:
@@ -893,8 +893,12 @@ class QEFFBaseModel(ABC):
             onnx_transforms = OnnxTransformPipeline(transforms=active_transforms)
             model, transformed = onnx_transforms.apply(model, **transform_kwargs)
 
-            if getattr(self.model.config, "model_type", None) in {"minimax_m3_vl", "minimax_m3_vl_text"}:
-                _normalize_minimax_retained_state_inputs(model)
+            if getattr(self.model.config, "model_type", None) in {
+                "minimax_m3_vl",
+                "minimax_m3_vl_text",
+                "deepseek_v4",
+            }:
+                _normalize_retained_state_inputs(model)
 
             # Dynamo records module paths in node metadata but uses generic node
             # names. The compiler and MDP tooling consume node names, so expose
