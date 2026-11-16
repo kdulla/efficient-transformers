@@ -5,7 +5,6 @@
 #
 # -----------------------------------------------------------------------------
 
-import math
 import re
 from functools import partial
 from math import lcm
@@ -134,12 +133,18 @@ def _dynamic_sequence_nested_chunks(
     )
 
 
-def _decoder_function_npi_names(model: onnx.ModelProto) -> list[str]:
-    """Collect RMSNorms and decoder residual merges inside MiniMax functions."""
+_MINIMAX_ROUTER_FP32_NODE_PREFIX = "minimax_router_fp32_"
+
+
+def _decoder_function_npi_names(model: onnx.ModelProto) -> tuple[list[str], bool]:
+    """Collect precision-sensitive outputs inside MiniMax decoder functions."""
     functions = {(function.domain, function.name): function for function in model.functions}
     npi_names = []
+    renamed_router_nodes = False
+    processed_router_functions = set()
     for function_call in model.graph.node:
-        function = functions.get((function_call.domain, function_call.op_type))
+        function_key = (function_call.domain, function_call.op_type)
+        function = functions.get(function_key)
         is_decoder_call = "/language_model/layers." in function_call.name or function_call.op_type.startswith(
             "QEffMiniMaxM3VLDecoderLayer"
         )
@@ -159,7 +164,86 @@ def _decoder_function_npi_names(model: onnx.ModelProto) -> list[str]:
             if function_node.op_type in ("Add", "CustomRMSNorm") and function_node.name
         ]
         npi_names.extend(f"{layer_scope}/{function_node.name}_output_0" for function_node in residual_adds)
-    return npi_names
+        if function_key not in processed_router_functions:
+            router_nodes = _router_fp32_nodes(function.node)
+            for function_node in router_nodes:
+                if not function_node.name.startswith(_MINIMAX_ROUTER_FP32_NODE_PREFIX):
+                    function_node.name = f"{_MINIMAX_ROUTER_FP32_NODE_PREFIX}{function_node.name}"
+                    renamed_router_nodes = True
+                npi_names.append(function_node.name)
+            processed_router_functions.add(function_key)
+    return npi_names, renamed_router_nodes
+
+
+def _router_fp32_nodes(nodes) -> list[onnx.NodeProto]:
+    """Find the routed-MoE sigmoid and normalization chain by connectivity."""
+    producer = {output: node for node in nodes for output in node.output if output}
+    consumers = {}
+    router_nodes = []
+    for node in nodes:
+        for input_name in node.input:
+            consumers.setdefault(input_name, []).append(node)
+
+    for sigmoid in nodes:
+        if sigmoid.op_type != "Sigmoid" or not sigmoid.input or not sigmoid.output:
+            continue
+        cast = producer.get(sigmoid.input[0])
+        if cast is None or cast.op_type != "Cast" or not cast.name:
+            continue
+        sigmoid_output = sigmoid.output[0]
+        gather = next(
+            (
+                consumer
+                for consumer in consumers.get(sigmoid_output, ())
+                if consumer.op_type == "GatherElements" and consumer.name and consumer.output
+            ),
+            None,
+        )
+        if gather is None:
+            continue
+        gather_output = gather.output[0]
+        denominator = next(
+            (
+                consumer
+                for consumer in consumers.get(gather_output, ())
+                if consumer.op_type in ("Einsum", "ReduceSum") and consumer.name and consumer.output
+            ),
+            None,
+        )
+        if denominator is None:
+            continue
+
+        denominator_path = []
+        denominator_output = denominator.output[0]
+        while True:
+            path_consumers = consumers.get(denominator_output, ())
+            division = next(
+                (
+                    consumer
+                    for consumer in path_consumers
+                    if consumer.op_type == "Div"
+                    and consumer.name
+                    and consumer.output
+                    and gather_output in consumer.input
+                ),
+                None,
+            )
+            if division is not None:
+                router_nodes.extend([cast, sigmoid, gather, denominator, *denominator_path, division])
+                break
+            shape_node = next(
+                (
+                    consumer
+                    for consumer in path_consumers
+                    if consumer.op_type in ("Identity", "Reshape", "Unsqueeze") and consumer.name and consumer.output
+                ),
+                None,
+            )
+            if shape_node is None:
+                break
+            denominator_path.append(shape_node)
+            denominator_output = shape_node.output[0]
+    return router_nodes
 
 
 def _generate_minimax_npi_file(onnx_path: Union[str, Path]) -> str:
@@ -174,7 +258,8 @@ def _generate_minimax_npi_file(onnx_path: Union[str, Path]) -> str:
         for output_name in node.output
         if output_name and output_name.endswith(_MINIMAX_NPI_OUTPUT_SUFFIXES)
     ]
-    fp32_names.extend(_decoder_function_npi_names(model))
+    decoder_function_names, renamed_router_nodes = _decoder_function_npi_names(model)
+    fp32_names.extend(decoder_function_names)
     # Dynamo/torch.export can flatten decoder functions and replace the
     # hierarchical output names with generated names such as ``add_42`` and
     # ``rms_norm_7``.  Include graph-level residual/RMSNorm outputs, while
@@ -187,9 +272,19 @@ def _generate_minimax_npi_file(onnx_path: Union[str, Path]) -> str:
         for output_name in node.output
         if output_name
     )
+    fp32_names.extend(
+        output_name for node in _router_fp32_nodes(model.graph.node) for output_name in node.output if output_name
+    )
     fp32_names = list(dict.fromkeys(fp32_names))
     if not fp32_names:
         raise ValueError(f"Could not find Minimax FP32 NPI nodes in ONNX graph: {onnx_path}")
+
+    if renamed_router_nodes:
+        # Subfunctions are converted before call nodes exist, so call-qualified
+        # NPI names cannot select their internal router operations. Give only
+        # the sparse-router chain globally unique node names and persist them in
+        # the exported ONNX before compilation.
+        onnx.save(model, str(onnx_path))
 
     with npi_path.open("w") as fp:
         yaml.safe_dump({"FP32NodeInstanceNames": fp32_names}, fp, sort_keys=False)
@@ -199,6 +294,17 @@ def _generate_minimax_npi_file(onnx_path: Union[str, Path]) -> str:
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     first, second = x.chunk(2, dim=-1)
     return torch.cat((-second, first), dim=-1)
+
+
+def _materialize_decode_control(
+    control: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Give wrapper-to-layer inputs distinct storage once per shared layout.
+
+    invoke_subgraph rejects input aliases, including different views of the
+    same position/block tensor. Local fallback calls do not need these clones.
+    """
+    return {name: value.clone() for name, value in control.items()}
 
 
 def qeff_apply_rotary_pos_emb(
@@ -389,6 +495,94 @@ def _num_page_groups(num_logical_pages: int, cp: int) -> int:
 
 
 class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
+    @staticmethod
+    def _decode_gather_limit(position_dp: torch.Tensor, cp: int, hkv: int, index_block_size: int) -> torch.Tensor:
+        """Last readable compact-cache slot for each indexer row."""
+        _, dp, _ = position_dp.shape
+        rows = dp * cp * hkv
+        pos_max = position_dp.max(dim=-1).values
+        row_ids = torch.arange(rows, device=position_dp.device)
+        dp_lane_per_row = torch.div(row_ids, cp * hkv, rounding_mode="trunc")
+        pos_max_rows = pos_max[:, dp_lane_per_row]
+        if cp == 1:
+            return pos_max_rows
+        row_in_cycle = row_ids - torch.div(row_ids, cp * hkv, rounding_mode="trunc") * (cp * hkv)
+        way = torch.div(row_in_cycle, hkv, rounding_mode="trunc")
+        cycle_size = index_block_size * cp
+        cycles = torch.div(pos_max_rows, cycle_size, rounding_mode="trunc")
+        offset_in_way = pos_max_rows - cycles * cycle_size - way * index_block_size
+        offset_in_way = torch.where(
+            offset_in_way >= 0,
+            offset_in_way.clamp_max(index_block_size - 1),
+            torch.full_like(offset_in_way, -1),
+        )
+        return cycles * index_block_size + offset_in_way
+
+    # Keep compact-cache ownership and addressing with the indexer because
+    # block selection and future-block masking are model-specific.
+    @staticmethod
+    def _prepare_decode_control(
+        position_ids: torch.Tensor,
+        dp: int,
+        cp: int,
+        hkv: int,
+        index_block_size: int,
+        num_index_heads: int,
+        num_kv_blocks: int,
+        cache_block_size: int,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Position-only indexer metadata, shared by wrapper and local fallback.
+        """
+        batch, query_len = position_ids.shape
+        batch_local = batch // dp
+        rows = dp * cp * hkv
+        position_dp = position_ids.view(dp, batch_local, query_len).permute(1, 0, 2)
+        logical_index_block = position_dp // index_block_size
+        live_way = (
+            (logical_index_block % cp)[:, :, None, None, :]
+            .expand(batch_local, dp, cp, hkv, query_len)
+            .reshape(batch_local, rows, query_len)
+        )
+        row_idx = torch.arange(rows, device=position_ids.device).view(1, rows, 1)
+        row_way = row_idx.remainder(cp * hkv) // hkv
+        row_live = row_way == live_way
+        batch_id = (
+            torch.arange(batch_local, device=position_ids.device)
+            .view(batch_local, 1, 1)
+            .expand(batch_local, rows, query_len)
+        )
+        block_id = torch.where(row_live, batch_id, torch.iinfo(torch.int32).max).to(torch.int32)
+        addr = (
+            ((logical_index_block // cp) * index_block_size + position_dp % index_block_size)
+            .to(torch.int32)[:, :, None, None, :]
+            .expand(batch_local, dp, cp, hkv, query_len)
+            .reshape(batch_local, rows, query_len)
+        )
+        q_pos_rows = (
+            position_dp[:, :, 0].view(batch_local, dp, 1, 1).expand(batch_local, dp, cp, hkv).reshape(batch_local, rows)
+        )
+        q_block_rows = (
+            logical_index_block[:, :, 0]
+            .view(batch_local, dp, 1, 1)
+            .expand(batch_local, dp, cp, hkv)
+            .reshape(batch_local, rows)
+        )
+        current_block_ids = logical_index_block.view(batch_local, dp, 1, 1, query_len, 1).expand(
+            batch_local, dp, hkv, num_index_heads // hkv, query_len, 1
+        )
+        block_starts = torch.arange(num_kv_blocks, device=position_ids.device) * cache_block_size * cp
+        return {
+            "position_dp": position_dp,
+            "block_id": block_id,
+            "addr": addr,
+            "q_pos_rows": q_pos_rows,
+            "q_block_rows": q_block_rows,
+            "current_block_ids": current_block_ids,
+            "gather_limit": QEffMiniMaxM3VLIndexer._decode_gather_limit(position_dp, cp, hkv, index_block_size),
+            "skip_future": q_pos_rows.unsqueeze(-1) < block_starts,
+        }
+
     def _apply_rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         """Apply partial RoPE while preserving the remainder of the index head."""
         rotary_dim = min(
@@ -436,29 +630,14 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
         index_block_size: int,
         cp: int,
         hkv: int,
+        prepared_gather_limit=None,
     ) -> torch.Tensor:
         """Gather one compact GP cache range while masking future positions."""
         batch_local, rows, _, _ = index_key_cache.shape
         block_len = end_index - start_index
-        pos_max = position_ids_dp.max(dim=-1).values
-        dp_lane_per_row = torch.div(torch.arange(rows, device=index_key_cache.device), cp * hkv, rounding_mode="trunc")
-        pos_max_rows = pos_max[:, dp_lane_per_row]
-
-        if cp == 1:
-            gather_limit = pos_max_rows
-        else:
-            row_ids = torch.arange(rows, device=index_key_cache.device)
-            row_in_cycle = row_ids - torch.div(row_ids, cp * hkv, rounding_mode="trunc") * (cp * hkv)
-            way = torch.div(row_in_cycle, hkv, rounding_mode="trunc")
-            cycle_size = index_block_size * cp
-            cycles = torch.div(pos_max_rows, cycle_size, rounding_mode="trunc")
-            offset_in_way = pos_max_rows - cycles * cycle_size - way * index_block_size
-            offset_in_way = torch.where(
-                offset_in_way >= 0,
-                offset_in_way.clamp_max(index_block_size - 1),
-                torch.full_like(offset_in_way, -1),
-            )
-            gather_limit = cycles * index_block_size + offset_in_way
+        gather_limit = prepared_gather_limit
+        if gather_limit is None:
+            gather_limit = QEffMiniMaxM3VLIndexer._decode_gather_limit(position_ids_dp, cp, hkv, index_block_size)
 
         ctx_indices = torch.arange(start_index, end_index, device=index_key_cache.device).view(1, 1, block_len)
         invalid_idx = torch.iinfo(torch.int32).max if torch.onnx.is_in_onnx_export() else 0
@@ -978,6 +1157,8 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
         sin: torch.Tensor,
         blocking_config: Optional[AttentionBlockingConfig] = None,
         block_table: Optional[torch.Tensor] = None,
+        prepared_control=None,
+        prepared_projections=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         cfg = self.config
         if block_table is not None:
@@ -1001,7 +1182,15 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
         # mandatory current block without scoring its partially-filled tokens.
         if blocking_config is not None:
             return self._select_blocks_dp(
-                hidden_states, position_ids, past_key_values, layer_idx, cos, sin, blocking_config
+                hidden_states,
+                position_ids,
+                past_key_values,
+                layer_idx,
+                cos,
+                sin,
+                blocking_config,
+                prepared_control=prepared_control,
+                prepared_projections=prepared_projections,
             )
 
         idx_q = self.q_proj(hidden_states).view(batch, seq_len, cfg.index_n_heads, cfg.index_head_dim).transpose(1, 2)
@@ -1400,6 +1589,38 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
         past_key_values.index_keys[layer_idx] = index_key_cache
         return safe_block_indices, block_valid
 
+    def _project_rotary_decode(self, hidden_states, cos, sin, blocking_config):
+        """Prepare the existing sparse-indexer Q/K tensors outside the call."""
+        cfg = self.config
+        batch, query_len = hidden_states.shape[:2]
+        dp = blocking_config.msa_indexer_dp
+        batch_local = batch // dp
+        hkv = blocking_config.indexer_n_head if blocking_config.indexer_n_head else 1
+        num_index_heads = cfg.index_n_heads
+        dim = cfg.index_head_dim
+        if cos.ndim == 3:
+            cos_dp = cos.view(dp, batch_local, query_len, cos.shape[-1]).permute(1, 0, 2, 3)
+            sin_dp = sin.view(dp, batch_local, query_len, sin.shape[-1]).permute(1, 0, 2, 3)
+        else:
+            cos_dp, sin_dp = cos, sin
+        idx_q = self.q_proj(hidden_states).view(dp, batch_local, query_len, num_index_heads, dim).permute(1, 0, 3, 2, 4)
+        idx_k = self.k_proj(hidden_states).view(dp, batch_local, query_len, hkv, dim).permute(1, 0, 3, 2, 4)
+        idx_q = self.q_norm(idx_q)
+        idx_k = self.k_norm(idx_k)
+        idx_q = self._apply_rope_dp(
+            idx_q,
+            cos_dp,
+            sin_dp,
+            int(cfg.head_dim * cfg.rope_parameters.get("partial_rotary_factor", 1.0)),
+        )
+        idx_k = self._apply_rope_dp(
+            idx_k,
+            cos_dp,
+            sin_dp,
+            int(cfg.head_dim * cfg.rope_parameters.get("partial_rotary_factor", 1.0)),
+        )
+        return idx_q, idx_k
+
     def _select_blocks_dp(
         self,
         hidden_states: torch.Tensor,
@@ -1409,6 +1630,8 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
         cos: torch.Tensor,
         sin: torch.Tensor,
         blocking_config: Optional[AttentionBlockingConfig] = None,
+        prepared_control=None,
+        prepared_projections=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """DP-optimised block selection using the GP cache custom operations.
 
@@ -1483,55 +1706,29 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
         # The external batch is DP-major: [dp0 local batches, dp1 local
         # batches, ...].  Convert once to the internal [B_local, DP, ...]
         # layout; keep the row axis [B_local, DP*cp*hkv] unchanged.
-        position_ids_dp = position_ids.view(dp, batch_local, query_len).permute(1, 0, 2)
-        if cos.ndim == 3:
-            cos_dp = cos.view(dp, batch_local, query_len, cos.shape[-1]).permute(1, 0, 2, 3)
-            sin_dp = sin.view(dp, batch_local, query_len, sin.shape[-1]).permute(1, 0, 2, 3)
+        if prepared_control is None:
+            prepared_control = QEffMiniMaxM3VLIndexer._prepare_decode_control(
+                position_ids,
+                dp,
+                cp,
+                hkv,
+                cfg.index_block_size,
+                num_index_heads,
+                num_kv_blocks,
+                cache_block_size,
+            )
+        position_ids_dp = prepared_control["position_dp"]
+        if prepared_projections is None:
+            idx_q, idx_k = self._project_rotary_decode(hidden_states, cos, sin, blocking_config)
         else:
-            cos_dp, sin_dp = cos, sin
-        idx_q = self.q_proj(hidden_states).view(dp, batch_local, query_len, num_index_heads, dim).permute(1, 0, 3, 2, 4)
-        idx_k = self.k_proj(hidden_states).view(dp, batch_local, query_len, hkv, dim).permute(1, 0, 3, 2, 4)
-        idx_q = self.q_norm(idx_q)
-        idx_k = self.k_norm(idx_k)
-        idx_q = self._apply_rope_dp(
-            idx_q,
-            cos_dp,
-            sin_dp,
-            int(cfg.head_dim * cfg.rope_parameters.get("partial_rotary_factor", 1.0)),
-        )
-        idx_k = self._apply_rope_dp(
-            idx_k,
-            cos_dp,
-            sin_dp,
-            int(cfg.head_dim * cfg.rope_parameters.get("partial_rotary_factor", 1.0)),
-        )
+            idx_q, idx_k = prepared_projections
 
         k_updates = (
             idx_k.unsqueeze(2)
             .expand(batch_local, dp, cp, hkv, query_len, dim)
             .reshape(batch_local, rows, query_len, dim)
         )
-        logical_index_block = position_ids_dp // cfg.index_block_size
-        live_way = (
-            (logical_index_block % cp)[:, :, None, None, :]
-            .expand(batch_local, dp, cp, hkv, query_len)
-            .reshape(batch_local, rows, query_len)
-        )
-        row_idx = torch.arange(rows, device=hidden_states.device).view(1, rows, 1)
-        row_way = row_idx.remainder(cp * hkv) // hkv
-        row_live = row_way == live_way
-        batch_id = (
-            torch.arange(batch_local, device=hidden_states.device)
-            .view(batch_local, 1, 1)
-            .expand(batch_local, rows, query_len)
-        )
-        block_id = torch.where(row_live, batch_id, torch.iinfo(torch.int32).max).to(torch.int32)
-        addr = (
-            ((logical_index_block // cp) * cfg.index_block_size + position_ids_dp % cfg.index_block_size)
-            .to(torch.int32)[:, :, None, None, :]
-            .expand(batch_local, dp, cp, hkv, query_len)
-            .reshape(batch_local, rows, query_len)
-        )
+        block_id, addr = prepared_control["block_id"], prepared_control["addr"]
         index_key_cache = ctx_paged_scatter_dp(index_key_cache, block_id, addr, k_updates)
 
         q_heads_per_kv = num_index_heads // hkv
@@ -1541,13 +1738,6 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
             .unsqueeze(2)
             .expand(batch_local, dp, cp, hkv, q_heads_per_kv, query_len, dim)
             .reshape(batch_local, rows, ql_eff, dim)
-        )
-
-        q_pos_rows_all = (
-            position_ids_dp[:, :, 0]
-            .view(batch_local, dp, 1, 1)
-            .expand(batch_local, dp, cp, hkv)
-            .reshape(batch_local, rows)
         )
 
         block_ranges: list[tuple[int, int]] = []
@@ -1586,15 +1776,21 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
             # q_5d: [local, rows, num_cores, ql_eff, dim]
             device_block_score_groups: list[torch.Tensor] = []
             device_block_id_groups: list[torch.Tensor] = []
-            q_block_rows = (
-                (position_ids_dp[batch_start:batch_end, :, 0] // cfg.index_block_size)
-                .view(local, dp, 1, 1)
-                .expand(local, dp, cp, hkv)
-                .reshape(local, rows)
-            )
+            q_block_rows = prepared_control["q_block_rows"][batch_start:batch_end]
 
-            def read_key_block(start: int, end: int) -> torch.Tensor:
-                return self._read_blocked_k_dp(key_local, pos_local, start, end, cfg.index_block_size, cp, hkv)
+            gather_limit_local = prepared_control["gather_limit"][batch_start:batch_end]
+
+            def read_key_block(start: int, end: int, gather_limit=gather_limit_local) -> torch.Tensor:
+                return self._read_blocked_k_dp(
+                    key_local,
+                    pos_local,
+                    start,
+                    end,
+                    cfg.index_block_size,
+                    cp,
+                    hkv,
+                    gather_limit,
+                )
 
             def compute_block_scores(key_5d: torch.Tensor) -> torch.Tensor:
                 score_block = torch.matmul(q_5d.float(), key_5d.transpose(-1, -2).float())
@@ -1614,7 +1810,7 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
             for block_idx in range(len(block_ranges) - 1):
                 start, _ = block_ranges[block_idx]
                 block_ids_rows = make_block_ids_rows(start, local)
-                block_skip_future = q_pos_rows_all[batch_start:batch_end] < start * cp
+                block_skip_future = prepared_control["skip_future"][batch_start:batch_end, :, block_idx]
                 if skip_kv and not is_export and bool(block_skip_future.all().item()):
                     masked_block = torch.full(
                         (local, rows, num_cores, ql_eff, blocks_per_core),
@@ -1645,7 +1841,7 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
                 epilogue_idx = len(block_ranges) - 1
                 epilogue_start, _ = block_ranges[epilogue_idx]
                 epilogue_block_ids = make_block_ids_rows(epilogue_start, local)
-                epilogue_skip_future = q_pos_rows_all[batch_start:batch_end] < epilogue_start * cp
+                epilogue_skip_future = prepared_control["skip_future"][batch_start:batch_end, :, epilogue_idx]
                 epilogue_scores = compute_block_scores(key_5d)
                 if skip_kv:
                     epilogue_scores = torch.where(
@@ -1706,19 +1902,7 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
         # Second Top-K: merge cp candidates on each DP/Hkv lane.
         topk_scores, candidate_topk = torch.topk(candidate_scores, k=selected_blocks, dim=-1)
         block_indices = torch.gather(candidate_block_indices, -1, candidate_topk)
-        current_block_ids = (
-            (position_ids.view(dp, batch_local, query_len).permute(1, 0, 2) // cfg.index_block_size)
-            .view(batch_local, dp, 1, 1, query_len, 1)
-            .expand(
-                batch_local,
-                dp,
-                hkv,
-                q_heads_per_kv,
-                query_len,
-                1,
-            )
-            .to(block_indices.dtype)
-        )
+        current_block_ids = prepared_control["current_block_ids"].to(block_indices.dtype)
         block_indices = torch.cat([block_indices[..., :-1], current_block_ids], dim=-1)
         topk_scores = torch.cat(
             [topk_scores[..., :-1], torch.zeros_like(topk_scores[..., -1:])],
@@ -2020,6 +2204,159 @@ class QEffMiniMaxM3VLIndexer(MiniMaxM3VLIndexer):
 
 class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
     @staticmethod
+    def _gqa_gather_limit(position_dp: torch.Tensor, cp: int, hkv: int) -> torch.Tensor:
+        """Last readable interleaved-cache slot for each GQA row."""
+        batch_local, dp, _ = position_dp.shape
+        rows = dp * cp * hkv
+        pos_max = position_dp.max(dim=-1).values
+        way = torch.arange(rows, device=position_dp.device).remainder(cp * hkv) // hkv
+        return ((pos_max[:, :, None] - way.view(1, dp, hkv * cp)) // cp).reshape(batch_local, rows, 1)
+
+    # Keep per-core attention thresholds with the model attention while
+    # preparing the related cache ownership and scatter metadata together.
+    @staticmethod
+    def _prepare_gqa_decode_control(
+        position_ids: torch.Tensor,
+        dp: int,
+        cp: int,
+        hkv: int,
+        num_cores: int,
+        num_kv_blocks: int,
+        cache_slots: int,
+    ) -> dict[str, torch.Tensor]:
+        """
+        GQA scatter indices and thresholds, shared by wrapper and local
+        fallback.
+        """
+        batch, query_len = position_ids.shape
+        batch_local = batch // dp
+        rows = dp * cp * hkv
+        cache_block_size = cache_slots // num_kv_blocks
+        tokens_per_core = cache_block_size // num_cores
+        position_dp = position_ids.view(dp, batch_local, query_len).permute(1, 0, 2)
+        live_way = (
+            (position_dp % cp)[:, :, None, None, :]
+            .expand(batch_local, dp, cp, hkv, query_len)
+            .reshape(batch_local, rows, query_len)
+        )
+        way_rows = torch.arange(rows, device=position_ids.device).remainder(cp * hkv) // hkv
+        row_live = way_rows.view(1, rows, 1) == live_way
+        addr = (
+            (position_dp // cp)[:, :, None, None, :]
+            .expand(batch_local, dp, cp, hkv, query_len)
+            .reshape(batch_local, rows, query_len)
+            .to(torch.int32)
+        )
+        block_id = torch.arange(batch_local, device=position_ids.device).view(batch_local, 1, 1)
+        block_id = block_id.expand(batch_local, rows, query_len)
+        block_id = torch.where(
+            row_live,
+            block_id,
+            torch.full_like(block_id, torch.iinfo(torch.int32).max),
+        )
+        query_position_rows = (
+            position_dp[:, :, 0].unsqueeze(-1).expand(batch_local, dp, cp * hkv).reshape(batch_local, rows)
+        )
+        row_way = way_rows.view(1, rows, 1, 1)
+        query_slot = torch.where(
+            query_position_rows[:, :, None, None] >= row_way,
+            (query_position_rows[:, :, None, None] - row_way) // cp,
+            torch.full_like(query_position_rows[:, :, None, None], -1),
+        )
+        block_indices = torch.arange(num_kv_blocks, device=position_ids.device).view(1, 1, 1, num_kv_blocks)
+        relative_slot = query_slot - block_indices * cache_block_size
+        core_start = torch.arange(num_cores, device=position_ids.device).view(1, 1, num_cores, 1) * tokens_per_core
+        core_end = core_start + tokens_per_core - 1
+        thresholds = torch.where(
+            relative_slot >= core_end,
+            torch.full_like(relative_slot, tokens_per_core - 1),
+            torch.where(
+                relative_slot >= core_start,
+                relative_slot - core_start,
+                torch.full_like(relative_slot, -1),
+            ),
+        )
+        return {
+            "position_dp": position_dp,
+            "block_id": block_id.to(torch.int32),
+            "addr": addr,
+            "thresholds": thresholds,
+            "gather_limit": QEffMiniMaxM3VLAttention._gqa_gather_limit(position_dp, cp, hkv),
+        }
+
+    # Keep prepared sparse-write addresses model-local until the cache API can
+    # accept prepared controls directly.
+    @staticmethod
+    def _prepare_sparse_write_control(position_ids, dp, cp, hkv, local_ctx_len):
+        """
+        Match QEffMiniMaxSparseCache's contiguous-CP writer, including invalid
+        owners.
+        """
+        batch, query_len = position_ids.shape
+        batch_local = batch // dp
+        rows = dp * hkv * cp
+        position_dp = position_ids.view(dp, batch_local, query_len).permute(1, 0, 2)
+        owner_cp = position_dp // local_ctx_len
+        owner_valid = (owner_cp >= 0) & (owner_cp < cp)
+        local_pos = position_dp - owner_cp * local_ctx_len
+        row_cp = torch.arange(rows, device=position_ids.device).remainder(hkv * cp) // hkv
+        row_live = row_cp.view(1, dp, cp, hkv, 1) == owner_cp.view(batch_local, dp, 1, 1, query_len)
+        row_live = row_live & owner_valid.view(batch_local, dp, 1, 1, query_len)
+        row_live = row_live.expand(batch_local, dp, cp, hkv, query_len).reshape(batch_local, rows, query_len)
+        addr = (
+            local_pos.view(batch_local, dp, 1, 1, query_len)
+            .expand(batch_local, dp, cp, hkv, query_len)
+            .reshape(batch_local, rows, query_len)
+            .to(torch.int32)
+        )
+        batch_idx = torch.arange(batch_local, device=position_ids.device).view(batch_local, 1, 1)
+        block_id = torch.where(
+            row_live,
+            batch_idx.expand(batch_local, rows, query_len),
+            torch.iinfo(torch.int32).max,
+        ).to(torch.int32)
+        return _materialize_decode_control({"block_id": block_id, "addr": addr})
+
+    @staticmethod
+    def _write_sparse_decode_with_control(cache, key_states, value_states, layer_idx, cache_kwargs, control):
+        """
+        Use prepared indices with the existing paged scatter op and cache
+        bookkeeping.
+        """
+        if control is None:
+            return cache.write_only_sparse(key_states, value_states, layer_idx, cache_kwargs)
+        cache.append_new_layers(layer_idx)
+        layer = cache.layers[layer_idx]
+        if layer.keys is None:
+            return cache.write_only_sparse(key_states, value_states, layer_idx, cache_kwargs)
+        layer._mark_initialized(layer.keys)
+        batch, _, query_len, head_dim = key_states.shape
+        dp, cp, hkv = (
+            cache_kwargs["dp"],
+            cache_kwargs["cp"],
+            cache_kwargs["hkv"],
+        )
+        batch_local = batch // dp
+        rows = dp * cp * hkv
+        if tuple(layer.values.shape) != tuple(layer.keys.shape) or layer.keys.shape[3] != head_dim:
+            raise ValueError("Prepared CP sparse key/value cache shapes must match the updates.")
+        key_dp = key_states.view(dp, batch_local, query_len, hkv, head_dim).permute(1, 0, 3, 2, 4)
+        value_dp = value_states.view(dp, batch_local, query_len, hkv, head_dim).permute(1, 0, 3, 2, 4)
+        key_updates = (
+            key_dp.unsqueeze(2)
+            .expand(batch_local, dp, cp, hkv, query_len, head_dim)
+            .reshape(batch_local, rows, query_len, head_dim)
+        )
+        value_updates = (
+            value_dp.unsqueeze(2)
+            .expand(batch_local, dp, cp, hkv, query_len, head_dim)
+            .reshape(batch_local, rows, query_len, head_dim)
+        )
+        layer.keys = cache.paged_scatter(layer.keys, control["block_id"], control["addr"], key_updates)
+        layer.values = cache.paged_scatter(layer.values, control["block_id"], control["addr"], value_updates)
+        layer._mark_initialized(layer.keys)
+
+    @staticmethod
     def _gqa_read_blocked_dp(
         cache: torch.Tensor,
         position_ids_dp: torch.Tensor,
@@ -2028,16 +2365,20 @@ class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
         cp: int,
         *,
         zero_invalid: bool,
+        prepared_gather_limit=None,
     ) -> torch.Tensor:
-        """Read one block from the microbenchmark's [B_local, DP*CP*Hkv, T/CP, D] cache."""
+        """
+        Read one block from the microbenchmark's [B_local, DP*CP*Hkv, T/CP, D]
+        cache.
+        """
         batch_local, rows, _, _ = cache.shape
         dp = position_ids_dp.shape[1]
         heads_per_dp = rows // dp
         hkv = heads_per_dp // cp
         block_len = end_index - start_index
-        pos_max = position_ids_dp.max(dim=-1).values
-        way = torch.arange(rows, device=cache.device).remainder(cp * hkv) // hkv
-        gather_limit = ((pos_max[:, :, None] - way.view(1, dp, hkv * cp)) // cp).reshape(batch_local, rows, 1)
+        gather_limit = prepared_gather_limit
+        if gather_limit is None:
+            gather_limit = QEffMiniMaxM3VLAttention._gqa_gather_limit(position_ids_dp, cp, hkv)
         ctx_indices = torch.arange(start=start_index, end=end_index, device=cache.device)[None, None, :]
         invalid_mask = ctx_indices > gather_limit
         invalid_idx_value = torch.iinfo(torch.int32).max if torch.compiler.is_exporting() else 0
@@ -2186,6 +2527,7 @@ class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
         value_cache: torch.Tensor,
         position_ids: torch.Tensor,
         blocking_config: AttentionBlockingConfig,
+        prepared_control=None,
     ) -> torch.Tensor:
         """Port of MiniMaxM3GQADecodeAttention._kv_blocked_attn_decode."""
         batch, num_heads, query_len, head_dim = query_states.shape
@@ -2225,46 +2567,23 @@ class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
             .expand(batch_local, dp, cp, hkv, ql_eff, head_dim)
             .reshape(batch_local, rows, ql_eff, head_dim)
         )
-        position_dp = position_ids.view(dp, batch_local, query_len).permute(1, 0, 2)
-        way_rows = torch.arange(rows, device=query_states.device).remainder(cp * hkv) // hkv
-        query_position_rows = (
-            position_dp[:, :, 0].unsqueeze(-1).expand(batch_local, dp, cp * hkv).reshape(batch_local, rows)
-        )
-        row_way = way_rows.view(1, rows, 1, 1)
-        query_slot = torch.where(
-            query_position_rows[:, :, None, None] >= row_way,
-            (query_position_rows[:, :, None, None] - row_way) // cp,
-            torch.full_like(query_position_rows[:, :, None, None], -1),
-        )
-        block_indices = torch.arange(num_kv_blocks, device=query_states.device).view(1, 1, 1, num_kv_blocks)
-        relative_slot = query_slot - block_indices * cache_block_size
-        core_start = torch.arange(num_cores, device=query_states.device).view(1, 1, num_cores, 1) * tokens_per_core
-        core_end = core_start + tokens_per_core - 1
-        thresholds = torch.where(
-            relative_slot >= core_end,
-            torch.full_like(relative_slot, tokens_per_core - 1),
-            torch.where(relative_slot >= core_start, relative_slot - core_start, torch.full_like(relative_slot, -1)),
-        )
+        if prepared_control is None:
+            prepared_control = QEffMiniMaxM3VLAttention._prepare_gqa_decode_control(
+                position_ids,
+                dp,
+                cp,
+                hkv,
+                num_cores,
+                num_kv_blocks,
+                cache_slots,
+            )
+        position_dp = prepared_control["position_dp"]
+        thresholds = prepared_control["thresholds"]
         maxima_groups, sum_groups, output_groups = [], [], []
         # Skip fully future blocks only in eager runtime. During torch.export,
         # the data-dependent .item() guard must stay out of the traced graph;
         # export preserves the static loop and applies the skip mask below.
         is_export = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing() or torch._dynamo.is_compiling()
-        # Online softmax sums exp(score - max_score) over the context. At
-        # long context, the merged denominator can reach ctx_len (65536+),
-        # above FP16's largest finite value (65504), producing inf/NaN.
-        #
-        # Use an exact power-of-two divisor with each headroom;
-        # applying it to each per-block numerator and
-        # denominator preserves the final quotient while keeping the merge
-        # reductions in the finite FP16 range.
-        softmax_scale_log2 = max(0, math.ceil(math.log2(max(ctx_len, 1))) - 14)
-        softmax_scale = float(2.0 ** (-softmax_scale_log2))
-        if tokens_per_core > 2**14:
-            raise ValueError(
-                f"tokens_per_core={tokens_per_core} risks FP16 overflow in the per-block softmax sum; "
-                "increase num_kv_blocks or num_cores_per_device."
-            )
         for batch_idx in range(batch_local):
             q_core = query_rows[batch_idx : batch_idx + 1].unsqueeze(2).expand(1, rows, num_cores, ql_eff, head_dim)
             maxima, sums, outputs = [], [], []
@@ -2286,6 +2605,7 @@ class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
                     # values; otherwise an invalid cache read can overflow or
                     # produce NaN before the later score mask is applied.
                     zero_invalid=True,
+                    prepared_gather_limit=prepared_control["gather_limit"][batch_idx : batch_idx + 1],
                 ).view(1, rows, num_cores, tokens_per_core, head_dim)
                 value_block = self._gqa_read_blocked_dp(
                     value_cache[batch_idx : batch_idx + 1],
@@ -2294,6 +2614,7 @@ class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
                     end_index,
                     cp,
                     zero_invalid=True,
+                    prepared_gather_limit=prepared_control["gather_limit"][batch_idx : batch_idx + 1],
                 ).view(1, rows, num_cores, tokens_per_core, head_dim)
                 causal = torch.arange(tokens_per_core, device=query_states.device).view(1, 1, 1, -1)
                 causal = (causal > threshold.unsqueeze(-1)).unsqueeze(3).expand(-1, -1, -1, n_rep, -1)
@@ -2321,17 +2642,13 @@ class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
                 ).reshape(1, rows, num_cores, ql_eff, head_dim)
                 if skip_kv and is_export:
                     block_output = torch.where(skip_future.unsqueeze(-1), torch.zeros_like(block_output), block_output)
-                if softmax_scale_log2:
-                    # The same factor is applied to numerator and denominator,
-                    # so it cancels in cp_output / cp_sum. Scaling after the
-                    # per-block BMM avoids the subnormal input produced by
-                    # 1 / ctx_len while keeping the cross-block/core/CP
-                    # reductions bounded.
-                    block_sum = block_sum * softmax_scale
-                    block_output = block_output * softmax_scale
-                maxima.append(block_max)
-                sums.append(block_sum)
-                outputs.append(block_output)
+                # Keep per-block attention in the model dtype. Promote only
+                # the cross-block/core/CP merge so long-context reductions do
+                # not overflow FP16; the common factor used by the old
+                # softmax scaling is no longer needed.
+                maxima.append(block_max.float())
+                sums.append(block_sum.float())
+                outputs.append(block_output.float())
             maxima_groups.append(torch.stack(maxima))
             sum_groups.append(torch.stack(sums))
             output_groups.append(torch.stack(outputs))
@@ -2360,6 +2677,7 @@ class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
             .view(batch_local, dp, hkv, n_rep, query_len, head_dim)
             .permute(1, 0, 2, 3, 4, 5)
             .reshape(batch, num_heads, query_len, head_dim)
+            .to(query_states.dtype)
         )
 
     def _gqa_dedicated_attention(
@@ -2372,6 +2690,7 @@ class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
         position_ids: torch.Tensor,
         blocking_config: AttentionBlockingConfig,
         block_table: Optional[torch.Tensor],
+        prepared_control=None,
     ) -> torch.Tensor:
         paged = bool(blocking_config.paged_attention)
         cache_kwargs = {"position_ids": position_ids, "batch_index": None}
@@ -2428,24 +2747,27 @@ class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
             .expand(batch_local, dp, cp, hkv, 1, self.head_dim)
             .reshape(batch_local, rows, 1, self.head_dim)
         )
-        position_dp = position_ids.view(dp, batch_local, 1).permute(1, 0, 2)
-        live_way = (
-            (position_dp % cp)[:, :, None, None, :].expand(batch_local, dp, cp, hkv, 1).reshape(batch_local, rows, 1)
-        )
-        row_way = torch.arange(rows, device=query_states.device).remainder(cp * hkv) // hkv
-        row_live = row_way.view(1, rows, 1) == live_way
-        addr = (
-            (position_dp // cp)[:, :, None, None, :]
-            .expand(batch_local, dp, cp, hkv, 1)
-            .reshape(batch_local, rows, 1)
-            .to(torch.int32)
-        )
-        block_id = torch.arange(batch_local, device=query_states.device).view(batch_local, 1, 1)
-        block_id = block_id.expand(batch_local, rows, 1)
-        block_id = torch.where(row_live, block_id, torch.full_like(block_id, torch.iinfo(torch.int32).max))
+        if prepared_control is None:
+            prepared_control = QEffMiniMaxM3VLAttention._prepare_gqa_decode_control(
+                position_ids,
+                dp,
+                cp,
+                hkv,
+                int(blocking_config.num_cores_per_device or 1),
+                max(1, int(blocking_config.num_kv_blocks or 1)),
+                int(blocking_config.ctx_len or key_cache.shape[2] * cp) // cp,
+            )
+        block_id, addr = prepared_control["block_id"], prepared_control["addr"]
         layer.keys = past_key_values.paged_scatter(key_cache, block_id.to(torch.int32), addr, key_updates)
         layer.values = past_key_values.paged_scatter(value_cache, block_id.to(torch.int32), addr, value_updates)
-        return self._gqa_dedicated_decode(query_states, layer.keys, layer.values, position_ids, blocking_config)
+        return self._gqa_dedicated_decode(
+            query_states,
+            layer.keys,
+            layer.values,
+            position_ids,
+            blocking_config,
+            prepared_control,
+        )
 
     def _msa_attention_prefill(
         self,
@@ -3550,19 +3872,20 @@ class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
             position_ids=position_ids,
         )
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[Cache] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        **kwargs,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _project_rotary_qkv(self, hidden_states, position_embeddings):
+        """Project and rotate once, either inline or before a retained call."""
         input_shape = hidden_states.shape[:-1]
         hidden_states = hidden_states.to(dtype=self.q_proj.weight.dtype)
-        query_shape = (*input_shape, self.config.num_attention_heads, self.head_dim)
-        key_value_shape = (*input_shape, self.config.num_key_value_heads, self.head_dim)
+        query_shape = (
+            *input_shape,
+            self.config.num_attention_heads,
+            self.head_dim,
+        )
+        key_value_shape = (
+            *input_shape,
+            self.config.num_key_value_heads,
+            self.head_dim,
+        )
         blocking_config = getattr(self, "attn_blocking_config", AttentionBlockingConfig())
         dedicated_gqa = (
             self.indexer is None
@@ -3570,7 +3893,8 @@ class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
             and BlockingMode.resolve(blocking_config.mode) == BlockingMode.KV_MINIMAX_DEDICATED
         )
         if dedicated_gqa:
-            # Preserve the microbenchmark graph order: reshape/transpose before RMSNorm.
+            # Preserve the microbenchmark graph order: reshape/transpose before
+            # RMSNorm.
             query_states = self.q_proj(hidden_states).reshape(query_shape).transpose(1, 2)
             query_states = self.q_norm(query_states)
             key_states = self.k_proj(hidden_states).reshape(key_value_shape).transpose(1, 2)
@@ -3590,6 +3914,28 @@ class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
             sin,
             int(self.head_dim * self.config.rope_parameters.get("partial_rotary_factor", 1.0)),
         )
+        return hidden_states, query_states, key_states, value_states
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[Cache] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        input_shape = hidden_states.shape[:-1]
+        prepared_decode_control = kwargs.get("prepared_decode_control") or {}
+        prepared_attention_inputs = kwargs.get("prepared_attention_inputs")
+        if prepared_attention_inputs is None:
+            hidden_states, query_states, key_states, value_states = self._project_rotary_qkv(
+                hidden_states, position_embeddings
+            )
+        else:
+            hidden_states, query_states, key_states, value_states = prepared_attention_inputs[:4]
+        blocking_config = getattr(self, "attn_blocking_config", AttentionBlockingConfig())
+        cos, sin = position_embeddings if position_embeddings is not None else (None, None)
 
         cache_kwargs = {"position_ids": position_ids, "batch_index": kwargs.get("batch_index")}
         if attention_mask is not None:
@@ -3681,6 +4027,8 @@ class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
                     indexer_sin,
                     blocking_config=blocking_config,
                     block_table=indexer_block_table,
+                    prepared_control=prepared_decode_control.get("indexer"),
+                    prepared_projections=(None if prepared_attention_inputs is None else prepared_attention_inputs[4]),
                 )
             attn_dp = blocking_config.msa_attn_dp if (blocking_config and blocking_config.msa_attn_dp) else 1
             attn_cp = blocking_config.msa_attn_cp if (blocking_config and blocking_config.msa_attn_cp) else 1
@@ -3814,7 +4162,14 @@ class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
                 past_key_values.layers[self.layer_idx].values = value_cache
                 return self.o_proj(attn_output.to(dtype=self.o_proj.weight.dtype).contiguous()), None
             # Sparse decode gathers from the retained cache, so write the current token before either path.
-            past_key_values.write_only_sparse(key_states, value_states, self.layer_idx, cache_kwargs)
+            QEffMiniMaxM3VLAttention._write_sparse_decode_with_control(
+                past_key_values,
+                key_states,
+                value_states,
+                self.layer_idx,
+                cache_kwargs,
+                prepared_decode_control.get("sparse_write"),
+            )
             if attn_dp > 1 or attn_cp > 1 or msa_impl == "msa_attention_GP_batched":
                 layer = past_key_values.layers[self.layer_idx]
                 attention_impl = (
@@ -3858,6 +4213,7 @@ class QEffMiniMaxM3VLAttention(MiniMaxM3VLAttention):
                     position_ids,
                     blocking_config,
                     kwargs.get("gqa_block_table"),
+                    prepared_control=prepared_decode_control.get("gqa"),
                 )
                 attn_output = attn_output.transpose(1, 2).reshape(
                     *input_shape, self.config.num_attention_heads * self.head_dim
@@ -3979,6 +4335,23 @@ class QEffMiniMaxM3VLSparseMoeBlock(QEffMoEBlockMixin, MiniMaxM3VLSparseMoeBlock
 
 
 class QEffMiniMaxM3VLDecoderLayer(MiniMaxM3VLDecoderLayer):
+    def _prepare_retained_decode_inputs(self, hidden_states, position_embeddings, indexer_position_embeddings):
+        """
+        Leave RoPE consumers in the caller; retain attention/cache/MoE work.
+        """
+        attention = self.self_attn
+        normalized_hidden, query, key, value = attention._project_rotary_qkv(
+            self.input_layernorm(hidden_states), position_embeddings
+        )
+        indexer_projections = None
+        if attention.indexer is not None:
+            blocking_config = attention.attn_blocking_config
+            cos, sin = position_embeddings
+            if (blocking_config.msa_indexer_dp or 1) > 1 and indexer_position_embeddings is not None:
+                cos, sin = indexer_position_embeddings
+            indexer_projections = attention.indexer._project_rotary_decode(normalized_hidden, cos, sin, blocking_config)
+        return normalized_hidden, query, key, value, indexer_projections
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -3989,7 +4362,8 @@ class QEffMiniMaxM3VLDecoderLayer(MiniMaxM3VLDecoderLayer):
         **kwargs,
     ) -> torch.Tensor:
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        if kwargs.get("prepared_attention_inputs") is None:
+            hidden_states = self.input_layernorm(hidden_states)
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
@@ -4007,6 +4381,90 @@ class QEffMiniMaxM3VLDecoderLayer(MiniMaxM3VLDecoderLayer):
 
 
 class QEffMiniMaxM3VLTextModel(MiniMaxM3VLTextModel):
+    @staticmethod
+    def _prepare_layer_decode_control(position_ids, attention, past_key_values, by_layout):
+        """
+        Share by complete layout, never by layer number or mutable cache
+        contents.
+        """
+        config = getattr(attention, "attn_blocking_config", None)
+        if config is None or bool(config.paged_attention):
+            return {}
+        if attention.layer_idx >= len(past_key_values.layers):
+            return {}
+        layer = past_key_values.layers[attention.layer_idx]
+        if layer.keys is None or layer.values is None or layer.keys.ndim != 4:
+            return {}
+        if tuple(layer.keys.shape) != tuple(layer.values.shape) or layer.keys.device != position_ids.device:
+            return {}
+        batch = position_ids.shape[0]
+        hkv = attention.config.num_key_value_heads
+        if attention.indexer is None:
+            if BlockingMode.resolve(config.mode) != BlockingMode.KV_MINIMAX_DEDICATED:
+                return {}
+            dp, cp = int(config.attn_dp or 1), int(config.attn_cp or 1)
+            num_cores = int(config.num_cores_per_device or 1)
+            num_blocks = max(1, int(config.num_kv_blocks or 1))
+            ctx_len = int(config.ctx_len or layer.keys.shape[2] * cp)
+            cache_slots = ctx_len // cp
+            if (
+                batch % dp
+                or tuple(layer.keys.shape[:3]) != (batch // dp, dp * cp * hkv, cache_slots)
+                or ctx_len % cp
+                or cache_slots % num_blocks
+                or (cache_slots // num_blocks) % num_cores
+            ):
+                return {}
+            layout = ("gqa", dp, cp, hkv, num_cores, num_blocks, cache_slots)
+            if layout not in by_layout:
+                by_layout[layout] = _materialize_decode_control(
+                    QEffMiniMaxM3VLAttention._prepare_gqa_decode_control(position_ids, *layout[1:])
+                )
+            return {"gqa": by_layout[layout]}
+        # Share sparse controls between layers with the same cache layout.
+        result = {}
+        dp, cp = int(config.msa_attn_dp or 1), int(config.msa_attn_cp or 1)
+        if cp > 1 and batch % dp == 0 and tuple(layer.keys.shape[:2]) == (batch // dp, dp * cp * hkv):
+            layout = ("sparse_write", dp, cp, hkv, layer.keys.shape[2])
+            if layout not in by_layout:
+                by_layout[layout] = QEffMiniMaxM3VLAttention._prepare_sparse_write_control(position_ids, *layout[1:])
+            result["sparse_write"] = by_layout[layout]
+        indexer = attention.indexer
+        dp, cp = int(config.msa_indexer_dp or 1), int(config.msa_indexer_cp or 1)
+        hkv = int(config.indexer_n_head or 1)
+        ctx_len = config.ctx_len
+        num_blocks = max(1, int(config.indexer_num_blocks or config.num_kv_blocks or 1))
+        num_cores = int(config.num_cores_per_device or 1)
+        block_size = indexer.config.index_block_size
+        if (
+            not ctx_len
+            or batch % dp
+            or ctx_len % cp
+            or (ctx_len // cp) % num_blocks
+            or (ctx_len // cp // num_blocks) % num_cores
+            or block_size % cp
+            or (ctx_len // cp // num_blocks // num_cores) % block_size
+            or indexer.config.index_local_blocks != 1
+            or indexer.config.index_n_heads % hkv
+        ):
+            return result
+        layout = (
+            "indexer",
+            dp,
+            cp,
+            hkv,
+            block_size,
+            indexer.config.index_n_heads,
+            num_blocks,
+            ctx_len // cp // num_blocks,
+        )
+        if layout not in by_layout:
+            by_layout[layout] = _materialize_decode_control(
+                QEffMiniMaxM3VLIndexer._prepare_decode_control(position_ids, *layout[1:])
+            )
+        result["indexer"] = by_layout[layout]
+        return result
+
     def __qeff_init__(self):
         # Hoist pre-scaled RoPE tables onto the text model as parameters.  This
         # exports them as graph initializers, matching the established QEff
@@ -4097,15 +4555,72 @@ class QEffMiniMaxM3VLTextModel(MiniMaxM3VLTextModel):
                     indexer_dp, batch_local, indexer_sin.shape[1], indexer_sin.shape[-1]
                 ).permute(1, 0, 2, 3)
             indexer_position_embeddings = (indexer_cos, indexer_sin)
-        for decoder_layer in self.layers:
+        # QEfficient installs nested_compile_region wrappers only for its
+        # retained Dynamo export. The marker belongs to the temporary wrapper,
+        # so it does not leak into a subsequent ordinary inline export.
+        retained_decode_export = bool(self.layers) and all(
+            hasattr(
+                getattr(layer.forward, "__func__", layer.forward),
+                "__marked_compile_region_fn__",
+            )
+            for layer in self.layers
+        )
+        # Only the non-paged retained single-token path has shared control
+        # metadata.
+        # Calculate each complete layout before entering any decoder
+        # sub-function.
+        layer_decode_controls = [{} for _ in self.layers]
+        if (
+            retained_decode_export
+            and inputs_embeds.shape[1] == 1
+            and use_cache
+            and isinstance(past_key_values, QEffMiniMaxSparseCache)
+            and kwargs.get("batch_index") is None
+            and all(
+                kwargs.get(name) is None
+                for name in (
+                    "gqa_block_table",
+                    "msa_indexer_block_table",
+                    "msa_attn_block_table",
+                )
+            )
+        ):
+            controls_by_layout = {}
+            layer_decode_controls = [
+                QEffMiniMaxM3VLTextModel._prepare_layer_decode_control(
+                    position_ids,
+                    layer.self_attn,
+                    past_key_values,
+                    controls_by_layout,
+                )
+                for layer in self.layers
+            ]
+        for layer_idx, decoder_layer in enumerate(self.layers):
+            control = layer_decode_controls[layer_idx]
+            prepared_attention_inputs = None
+            layer_position_embeddings = position_embeddings
+            layer_indexer_position_embeddings = indexer_position_embeddings
+            if retained_decode_export and ("gqa" in control or ("indexer" in control and "sparse_write" in control)):
+                prepared_attention_inputs = decoder_layer._prepare_retained_decode_inputs(
+                    hidden_states,
+                    position_embeddings,
+                    indexer_position_embeddings,
+                )
+                # The retained body consumes projected/rotated tensors, not
+                # coefficient tensors. This is a boundary change, not a claim
+                # that view/clone operations enforce device replication.
+                layer_position_embeddings = None
+                layer_indexer_position_embeddings = None
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
-                position_embeddings=position_embeddings,
-                indexer_position_embeddings=indexer_position_embeddings,
+                position_embeddings=layer_position_embeddings,
+                indexer_position_embeddings=layer_indexer_position_embeddings,
+                prepared_attention_inputs=prepared_attention_inputs,
+                prepared_decode_control=layer_decode_controls[layer_idx],
                 **kwargs,
             )
         hidden_states = self.norm(hidden_states)

@@ -192,6 +192,118 @@ def _flatten_minimax_paged_ort_inputs(session, inputs):
     return ort_inputs
 
 
+def test_minimax_sparse_router_npi_names_are_unique_and_persisted(tmp_path):
+    import onnx
+    import yaml
+    from onnx import TensorProto, helper
+
+    from QEfficient.transformers.models.minimax_m3_vl.modeling_minimax_m3_vl import _generate_minimax_npi_file
+
+    sparse_nodes = [
+        helper.make_node(
+            "Cast", ["router_logits"], ["router_logits_fp32"], name="node__to_copy_34", to=TensorProto.FLOAT
+        ),
+        helper.make_node("Sigmoid", ["router_logits_fp32"], ["router_probs"], name="node_sigmoid"),
+        helper.make_node(
+            "GatherElements",
+            ["router_probs", "selected_indices"],
+            ["selected_weights"],
+            name="node_gather_4",
+            axis=-1,
+        ),
+        helper.make_node(
+            "Einsum",
+            ["selected_weights", "reduce_weights"],
+            ["denominator"],
+            name="node_einsum",
+            equation="...",
+        ),
+        helper.make_node("Unsqueeze", ["denominator", "axes"], ["denominator_expanded"], name="node_unsqueeze_51"),
+        helper.make_node("Div", ["selected_weights", "denominator_expanded"], ["normalized"], name="node_div_2"),
+    ]
+    sparse_function = helper.make_function(
+        "qeff",
+        "QEffMiniMaxM3VLDecoderLayer",
+        ["router_logits", "selected_indices", "reduce_weights", "axes"],
+        ["normalized"],
+        sparse_nodes,
+        [helper.make_opsetid("", 18)],
+    )
+    dense_nodes = [
+        helper.make_node("Cast", ["dense_input"], ["dense_fp32"], name="dense_router_cast", to=TensorProto.FLOAT),
+        helper.make_node("Sigmoid", ["dense_fp32"], ["dense_sigmoid"], name="dense_router_sigmoid"),
+    ]
+    dense_function = helper.make_function(
+        "qeff",
+        "QEffMiniMaxM3VLDenseMLP",
+        ["dense_input"],
+        ["dense_sigmoid"],
+        dense_nodes,
+        [helper.make_opsetid("", 18)],
+    )
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "QEffMiniMaxM3VLDecoderLayer",
+                ["router_logits", "selected_indices", "reduce_weights", "axes"],
+                ["sparse_output_0"],
+                name="/language_model/layers.0/QEffMiniMaxM3VLDecoderLayer",
+                domain="qeff",
+            ),
+            helper.make_node(
+                "QEffMiniMaxM3VLDecoderLayer",
+                ["router_logits", "selected_indices", "reduce_weights", "axes"],
+                ["sparse_output_1"],
+                name="/language_model/layers.1/QEffMiniMaxM3VLDecoderLayer",
+                domain="qeff",
+            ),
+            helper.make_node(
+                "QEffMiniMaxM3VLDenseMLP",
+                ["dense_input"],
+                ["dense_output"],
+                name="/language_model/layers.0/mlp/dense",
+                domain="qeff",
+            ),
+        ],
+        "minimax_router_npi_test",
+        [
+            helper.make_tensor_value_info("router_logits", TensorProto.FLOAT, [1, 4]),
+            helper.make_tensor_value_info("selected_indices", TensorProto.INT64, [1, 2]),
+            helper.make_tensor_value_info("reduce_weights", TensorProto.FLOAT, [1, 2]),
+            helper.make_tensor_value_info("axes", TensorProto.INT64, [1]),
+            helper.make_tensor_value_info("dense_input", TensorProto.FLOAT, [1]),
+        ],
+        [helper.make_tensor_value_info("dense_output", TensorProto.FLOAT, [1])],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("qeff", 1)],
+        functions=[sparse_function, dense_function],
+    )
+    onnx_path = tmp_path / "minimax.onnx"
+    onnx.save(model, onnx_path)
+
+    npi_path = _generate_minimax_npi_file(onnx_path)
+    with open(npi_path) as npi_file:
+        npi_names = yaml.safe_load(npi_file)["FP32NodeInstanceNames"]
+    expected_names = [
+        "minimax_router_fp32_node__to_copy_34",
+        "minimax_router_fp32_node_sigmoid",
+        "minimax_router_fp32_node_gather_4",
+        "minimax_router_fp32_node_einsum",
+        "minimax_router_fp32_node_unsqueeze_51",
+        "minimax_router_fp32_node_div_2",
+    ]
+
+    assert npi_names == expected_names
+    saved_functions = {(function.domain, function.name): function for function in onnx.load(onnx_path).functions}
+    assert [node.name for node in saved_functions[("qeff", "QEffMiniMaxM3VLDecoderLayer")].node] == expected_names
+    assert [node.name for node in saved_functions[("qeff", "QEffMiniMaxM3VLDenseMLP")].node] == [
+        "dense_router_cast",
+        "dense_router_sigmoid",
+    ]
+
+
 @pytest.mark.on_qaic
 @pytest.mark.llm_model
 @pytest.mark.accuracy

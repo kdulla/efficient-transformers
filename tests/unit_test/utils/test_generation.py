@@ -212,9 +212,61 @@ class TestGenerationModuleImportability:
         assert VisionLanguageGeneration is not None
 
 
-@pytest.mark.parametrize("name", ["indexer_key.0", "indexer_key.0_RetainedState"])
-def test_glm_indexer_cache_is_retained_state(name):
+@pytest.mark.parametrize(
+    "name",
+    [
+        "indexer_key.0",
+        "indexer_key.0_RetainedState",
+        "index_key.57",
+        "index_key.57_RetainedState",
+        "repeated_subgraph0/index_key.57_InternalRetainedState",
+    ],
+)
+def test_indexer_cache_is_retained_state(name):
     assert is_retained_state_name(name)
+
+
+def test_kv_dma_handoff_includes_minimax_index_key(monkeypatch):
+    import QEfficient.generation._kv_dma_handoff as kv_dma_handoff
+
+    monkeypatch.setattr(
+        kv_dma_handoff,
+        "qaicrt",
+        SimpleNamespace(QStatus=SimpleNamespace(QS_SUCCESS=0)),
+    )
+    names = ["index_key.57", "past_key.57"]
+    output_names = [f"{name}_RetainedState" for name in names]
+    all_names = names + output_names
+    session = SimpleNamespace(
+        cluster_id="decode",
+        stages=1,
+        input_names=names,
+        output_names=output_names,
+        binding_index_map={name: index for index, name in enumerate(all_names)},
+        bindings=[
+            SimpleNamespace(name=name, dims=[1, 1, 2, 2], type=1)
+            for name in all_names
+        ],
+        aic_to_np_dtype_mapping={1: np.dtype(np.float32)},
+        program=SimpleNamespace(createSlicingSpecHandle=lambda _: (0, object())),
+        execObj=[SimpleNamespace(setDataWithSlices=MagicMock(return_value=(0, None)))],
+        input_dumper=None,
+    )
+    handoff = kv_dma_handoff.KvDmaHandoff(session)
+    handoff.init_buffer_maps()
+
+    assert [name for name, _ in handoff.decode_buff_map] == names
+    cache_buffers = [np.zeros((1, 1, 2, 2), dtype=np.float32) for _ in names]
+    handoff.set_data_for_kv_handoff(
+        cache_buffers,
+        [("batch_index", 0), ("ctx_start", 0)],
+        buff_map=handoff.kv_only_buff_map,
+    )
+
+    submitted_binding_indices = [
+        binding_index for binding_index, _ in session.execObj[0].setDataWithSlices.call_args.args[0]
+    ]
+    assert submitted_binding_indices == [session.binding_index_map[name] for name in output_names]
 
 
 # ---------------------------------------------------------------------------
