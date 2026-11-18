@@ -8,6 +8,7 @@
 import argparse
 import math
 import time
+from pathlib import Path
 
 import torch
 from transformers import AutoConfig, AutoTokenizer
@@ -201,7 +202,10 @@ def main():
     execution_batch_size = _execution_batch_size(args.batch_size, args.msa_indexer_dp, args.msa_attn_dp, args.attn_dp)
 
     model_dtype = getattr(torch, args.dtype)
-    factory_kwargs = dict(kv_offload=True, dtype=model_dtype)
+    factory_kwargs = {"kv_offload": True, "dtype": model_dtype}
+    model_path = Path(args.model_id).expanduser()
+    if (model_path / ".checkpoint_prepared").is_file():
+        factory_kwargs["use_original_checkpoint"] = True
     config = AutoConfig.from_pretrained(args.model_id)
     config.dtype = model_dtype
     config.torch_dtype = model_dtype
